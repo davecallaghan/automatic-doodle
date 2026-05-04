@@ -143,7 +143,7 @@ fi
 gcloud compute instances create "$VM_NAME" \
     --project="$PROJECT_ID" \
     --zone="$ZONE" \
-    --machine-type=e2-medium \
+    --machine-type=e2-standard-2 \
     --no-address \
     --network-tier=PREMIUM \
     --service-account="$SA_EMAIL" \
@@ -627,6 +627,386 @@ chmod +x sandbox/gcp/schedule.sh
 echo -e "${GREEN}✅ sandbox/gcp/schedule.sh created${NC}"
 
 # -----------------------------------------------------------------------------
+# STEP 4.5: GENERATE DATABRICKS OSS SIDECAR STARTUP (Phase 1)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}🧱 Generating sandbox/gcp/sidecars.sh (Phase 1 of Databricks stack)...${NC}"
+
+cat > sandbox/gcp/sidecars.sh <<'SIDECARS_EOF'
+#!/bin/bash
+# =============================================================================
+# OPENCLAW SIDECARS — Phase 1 of the Databricks OSS Stack
+# =============================================================================
+# Starts Unity Catalog OSS and MLflow tracking servers as Docker sidecars on
+# the GCP VM. Both bind to 127.0.0.1 only — accessible from the host (and
+# from the openclaw container via the openclaw-net Docker network) but never
+# from outside the VM.
+#
+# Idempotent: safe to run multiple times. Skips containers already running.
+# =============================================================================
+
+set -euo pipefail
+
+UC_IMAGE="unitycatalog/unitycatalog:latest"
+MLFLOW_IMAGE="ghcr.io/mlflow/mlflow:latest"
+RESEARCH_DISK="/mnt/disks/research"
+NETWORK_NAME="openclaw-net"
+
+if ! mountpoint -q "$RESEARCH_DISK"; then
+    echo "ERROR: $RESEARCH_DISK is not mounted. Run setup.sh first."
+    exit 1
+fi
+if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: docker not installed. Run setup.sh first."
+    exit 1
+fi
+
+echo "Phase 1: starting Databricks OSS sidecars"
+echo ""
+
+if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+    echo "[net] $NETWORK_NAME already exists"
+else
+    docker network create --driver bridge "$NETWORK_NAME"
+    echo "[net] created $NETWORK_NAME"
+fi
+
+mkdir -p "$RESEARCH_DISK/unity_catalog/etc"
+mkdir -p "$RESEARCH_DISK/delta"
+mkdir -p "$RESEARCH_DISK/mlflow/mlruns"
+mkdir -p "$RESEARCH_DISK/mlflow/artifacts"
+chmod 750 "$RESEARCH_DISK/unity_catalog" "$RESEARCH_DISK/delta" "$RESEARCH_DISK/mlflow"
+echo "[disk] sidecar directories present under $RESEARCH_DISK"
+
+if docker ps --format '{{.Names}}' | grep -q "^unity-catalog$"; then
+    echo "[uc] unity-catalog already running"
+else
+    docker rm -f unity-catalog >/dev/null 2>&1 || true
+    docker run -d \
+        --name unity-catalog \
+        --network="$NETWORK_NAME" \
+        --restart unless-stopped \
+        -p 127.0.0.1:8080:8080 \
+        -v "$RESEARCH_DISK/unity_catalog/etc:/home/unitycatalog/etc" \
+        -v "$RESEARCH_DISK/delta:/home/unitycatalog/etc/data" \
+        --memory=512m \
+        --cpus=0.5 \
+        "$UC_IMAGE" \
+        bin/start-uc-server
+    echo "[uc] unity-catalog started on 127.0.0.1:8080"
+fi
+
+if docker ps --format '{{.Names}}' | grep -q "^mlflow-server$"; then
+    echo "[mlflow] mlflow-server already running"
+else
+    docker rm -f mlflow-server >/dev/null 2>&1 || true
+    docker run -d \
+        --name mlflow-server \
+        --network="$NETWORK_NAME" \
+        --restart unless-stopped \
+        -p 127.0.0.1:5000:5000 \
+        -v "$RESEARCH_DISK/mlflow:/mlflow" \
+        --memory=256m \
+        --cpus=0.5 \
+        "$MLFLOW_IMAGE" \
+        mlflow server \
+            --backend-store-uri /mlflow/mlruns \
+            --default-artifact-root /mlflow/artifacts \
+            --host 0.0.0.0 \
+            --port 5000
+    echo "[mlflow] mlflow-server started on 127.0.0.1:5000"
+fi
+
+echo ""
+echo "Waiting up to 30s for services to respond..."
+uc_ok=0; mlflow_ok=0
+for i in $(seq 1 30); do
+    curl -fsS -m 2 http://localhost:8080/api/2.1/unity-catalog/catalogs >/dev/null 2>&1 && uc_ok=1 || true
+    curl -fsS -m 2 http://localhost:5000/health >/dev/null 2>&1 && mlflow_ok=1 || true
+    if [ $uc_ok -eq 1 ] && [ $mlflow_ok -eq 1 ]; then
+        break
+    fi
+    sleep 1
+done
+
+echo ""
+echo "=== Sidecar Status ==="
+[ $uc_ok -eq 1 ]     && echo "✓ Unity Catalog responding at http://localhost:8080" \
+                     || echo "✗ Unity Catalog not responding (check: docker logs unity-catalog)"
+[ $mlflow_ok -eq 1 ] && echo "✓ MLflow responding at http://localhost:5000" \
+                     || echo "✗ MLflow not responding (check: docker logs mlflow-server)"
+
+if [ $uc_ok -eq 0 ] || [ $mlflow_ok -eq 0 ]; then
+    exit 1
+fi
+
+echo ""
+echo "Next: run 'python3 ~/openclaw/uc_init.py' to bootstrap the research catalog."
+SIDECARS_EOF
+
+chmod +x sandbox/gcp/sidecars.sh
+echo -e "${GREEN}✅ sandbox/gcp/sidecars.sh created${NC}"
+
+# -----------------------------------------------------------------------------
+# STEP 4.6: GENERATE UNITY CATALOG SCHEMA REFERENCE (Phase 1)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}📜 Generating openclaw/unity_catalog_setup.sql...${NC}"
+
+cat > openclaw/unity_catalog_setup.sql <<'UC_SQL_EOF'
+-- =============================================================================
+-- OPENCLAW UNITY CATALOG SCHEMA — canonical reference
+-- =============================================================================
+-- Phase 1 (uc_init.py): creates catalog and schemas only.
+-- Phase 2+ (databricks_worker.py): creates tables on first write via delta-rs.
+-- Table DDL preserved here as the spec the worker code must match.
+-- =============================================================================
+
+CREATE CATALOG IF NOT EXISTS research
+  COMMENT 'OpenClaw research datastore — bronze/silver/gold medallion + audit';
+
+CREATE SCHEMA IF NOT EXISTS research.bronze
+  COMMENT 'Raw, unfiltered: every agent response and source fetch';
+CREATE SCHEMA IF NOT EXISTS research.silver
+  COMMENT 'Validated and structured: passes schema and virtue checks';
+CREATE SCHEMA IF NOT EXISTS research.gold
+  COMMENT 'Curated: research summaries, fairness scorecards, run summaries';
+CREATE SCHEMA IF NOT EXISTS research.public_archive
+  COMMENT 'Human-promoted, CC BY 4.0 — only PROMOTED briefs land here';
+CREATE SCHEMA IF NOT EXISTS research.audit
+  COMMENT 'Append-only integrity chain — tamper-evident audit trail';
+
+-- BRONZE
+CREATE TABLE IF NOT EXISTS research.bronze.raw_responses (
+  response_id STRING NOT NULL, created_at TIMESTAMP NOT NULL,
+  agent_version STRING NOT NULL, model_id STRING NOT NULL,
+  prompt_hash STRING NOT NULL, response_text STRING NOT NULL,
+  response_hash STRING NOT NULL, mlflow_run_id STRING NOT NULL,
+  topic_id STRING
+) USING DELTA;
+
+CREATE TABLE IF NOT EXISTS research.bronze.source_fetches (
+  fetch_id STRING NOT NULL, response_id STRING NOT NULL,
+  fetched_at TIMESTAMP NOT NULL, url STRING NOT NULL,
+  http_status INT NOT NULL, body_hash STRING NOT NULL,
+  body_bytes BIGINT, content_type STRING, used_in_brief BOOLEAN NOT NULL
+) USING DELTA;
+
+-- SILVER
+CREATE TABLE IF NOT EXISTS research.silver.validated_briefs (
+  brief_id STRING NOT NULL, response_id STRING NOT NULL,
+  created_at TIMESTAMP NOT NULL, topic_id STRING NOT NULL,
+  title STRING NOT NULL, key_findings STRING NOT NULL,
+  counter_arguments STRING NOT NULL, practical_implications STRING NOT NULL,
+  further_reading STRING NOT NULL, known_gaps STRING,
+  content_hash STRING NOT NULL, agent_version STRING NOT NULL,
+  CONSTRAINT counter_argument_required CHECK (length(counter_arguments) >= 100)
+) USING DELTA;
+
+CREATE TABLE IF NOT EXISTS research.silver.citations (
+  citation_id STRING NOT NULL, brief_id STRING NOT NULL,
+  fetch_id STRING, url STRING NOT NULL, title STRING NOT NULL,
+  authority_tier INT NOT NULL, vendor_org STRING,
+  publication_date DATE, is_paid_content BOOLEAN NOT NULL,
+  t4_justification STRING,
+  CONSTRAINT tier_range CHECK (authority_tier BETWEEN 1 AND 4),
+  CONSTRAINT t4_requires_justification
+    CHECK (authority_tier <> 4 OR length(t4_justification) > 0)
+) USING DELTA;
+
+-- GOLD
+CREATE TABLE IF NOT EXISTS research.gold.research_summaries (
+  summary_id STRING NOT NULL, brief_id STRING NOT NULL,
+  created_at TIMESTAMP NOT NULL, status STRING NOT NULL,
+  rejection_reasons ARRAY<STRING>, override_reason STRING,
+  promoted_at TIMESTAMP, promoted_by STRING,
+  mlflow_run_id STRING NOT NULL,
+  CONSTRAINT status_values CHECK (status IN ('DRAFT', 'REJECTED', 'PROMOTED'))
+) USING DELTA;
+
+CREATE TABLE IF NOT EXISTS research.gold.fairness_scorecards (
+  scorecard_id STRING NOT NULL, brief_id STRING NOT NULL,
+  computed_at TIMESTAMP NOT NULL,
+  source_tier_t1_pct DOUBLE NOT NULL, source_tier_t2_pct DOUBLE NOT NULL,
+  source_tier_t3_pct DOUBLE NOT NULL, source_tier_t4_pct DOUBLE NOT NULL,
+  vendor_diversity_count INT NOT NULL,
+  counter_argument_ratio DOUBLE NOT NULL,
+  recency_within_18mo_pct DOUBLE NOT NULL,
+  paid_content_disclosed BOOLEAN NOT NULL, bias_check_complete BOOLEAN NOT NULL,
+  threshold_pass BOOLEAN NOT NULL, failed_thresholds ARRAY<STRING>
+) USING DELTA;
+
+CREATE TABLE IF NOT EXISTS research.gold.run_summaries (
+  run_summary_id STRING NOT NULL, mlflow_run_id STRING NOT NULL,
+  brief_id STRING NOT NULL, started_at TIMESTAMP NOT NULL,
+  ended_at TIMESTAMP NOT NULL, model_id STRING NOT NULL,
+  prompt_version STRING NOT NULL, agent_version STRING NOT NULL,
+  input_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL,
+  total_cost_usd DOUBLE NOT NULL, source_count INT NOT NULL,
+  unique_domain_count INT NOT NULL, latency_seconds DOUBLE NOT NULL,
+  retry_count INT NOT NULL
+) USING DELTA;
+
+-- PUBLIC ARCHIVE
+CREATE TABLE IF NOT EXISTS research.public_archive.published (
+  published_id STRING NOT NULL, summary_id STRING NOT NULL,
+  published_at TIMESTAMP NOT NULL, license STRING NOT NULL,
+  attribution STRING NOT NULL, markdown_export STRING NOT NULL,
+  content_hash STRING NOT NULL
+) USING DELTA;
+
+-- AUDIT (integrity chain replaces the flat write_log; see EXECUTION_integrity_engine.md)
+CREATE TABLE IF NOT EXISTS research.audit.integrity_chain (
+  sequence_id BIGINT NOT NULL, recorded_at TIMESTAMP NOT NULL,
+  author_identity STRING NOT NULL, operation STRING NOT NULL,
+  target_table STRING, target_row_id STRING,
+  target_payload_hash STRING NOT NULL, previous_hash STRING NOT NULL,
+  row_signature STRING NOT NULL, salt_version INT NOT NULL,
+  CONSTRAINT operation_values CHECK (operation IN
+    ('GENESIS', 'INSERT', 'UPDATE', 'DELETE', 'CHECKPOINT')),
+  CONSTRAINT sequence_monotonic CHECK (sequence_id >= 0),
+  CONSTRAINT salt_version_positive CHECK (salt_version >= 1)
+) USING DELTA
+PARTITIONED BY (DATE(recorded_at));
+
+CREATE TABLE IF NOT EXISTS research.audit.promotion_log (
+  promotion_id STRING NOT NULL, summary_id STRING NOT NULL,
+  promoted_at TIMESTAMP NOT NULL, promoted_by STRING NOT NULL,
+  override_reason STRING, prior_status STRING NOT NULL,
+  new_status STRING NOT NULL
+) USING DELTA;
+UC_SQL_EOF
+
+echo -e "${GREEN}✅ openclaw/unity_catalog_setup.sql created${NC}"
+
+# -----------------------------------------------------------------------------
+# STEP 4.7: GENERATE UNITY CATALOG INIT SCRIPT (Phase 1)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}🐍 Generating openclaw/uc_init.py...${NC}"
+
+cat > openclaw/uc_init.py <<'UC_INIT_EOF'
+#!/usr/bin/env python3
+"""Phase 1 bootstrap for Unity Catalog OSS — creates catalog + 5 schemas.
+
+Tables are NOT created here; the worker (Phase 2) creates them on first
+write via delta-rs. The canonical table DDL is in unity_catalog_setup.sql.
+Idempotent.
+"""
+from __future__ import annotations
+import json, os, sys, time
+from typing import Any
+from urllib import request, error
+
+UC_SERVER_URL = os.environ.get("UC_SERVER_URL", "http://localhost:8080")
+API_BASE = f"{UC_SERVER_URL.rstrip('/')}/api/2.1/unity-catalog"
+
+CATALOG_NAME = "research"
+CATALOG_COMMENT = "OpenClaw research datastore — bronze/silver/gold + audit"
+SCHEMAS: list[tuple[str, str]] = [
+    ("bronze",         "Raw, unfiltered: every agent response and source fetch"),
+    ("silver",         "Validated and structured: passes schema and virtue checks"),
+    ("gold",           "Curated: research summaries, fairness scorecards, run summaries"),
+    ("public_archive", "Human-promoted, CC BY 4.0 — only PROMOTED briefs land here"),
+    ("audit",          "Append-only integrity chain — tamper-evident audit trail"),
+]
+
+
+class UCError(RuntimeError): ...
+
+
+def _req(method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    url = f"{API_BASE}{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = request.Request(url, data=data, method=method,
+        headers={"Content-Type": "application/json"} if data else {})
+    try:
+        with request.urlopen(req, timeout=10) as resp:
+            payload = resp.read()
+            return json.loads(payload) if payload else {}
+    except error.HTTPError as e:
+        raise UCError(f"{method} {path} → HTTP {e.code}: {e.read().decode('utf-8','replace')}")
+    except error.URLError as e:
+        raise UCError(f"{method} {path} → connection error: {e.reason}")
+
+
+def wait_for_uc(timeout_seconds: int = 30) -> None:
+    deadline = time.time() + timeout_seconds
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        try:
+            _req("GET", "/catalogs"); return
+        except UCError as e:
+            last_err = e; time.sleep(1)
+    raise UCError(f"UC at {UC_SERVER_URL} not reachable after {timeout_seconds}s: {last_err}")
+
+
+def catalog_exists(name: str) -> bool:
+    try:
+        _req("GET", f"/catalogs/{name}"); return True
+    except UCError as e:
+        if "404" in str(e): return False
+        raise
+
+
+def schema_exists(catalog: str, name: str) -> bool:
+    try:
+        _req("GET", f"/schemas/{catalog}.{name}"); return True
+    except UCError as e:
+        if "404" in str(e): return False
+        raise
+
+
+def create_catalog(name: str, comment: str) -> None:
+    if catalog_exists(name):
+        print(f"[catalog] {name} already exists"); return
+    _req("POST", "/catalogs", {"name": name, "comment": comment})
+    print(f"[catalog] created {name}")
+
+
+def create_schema(catalog: str, name: str, comment: str) -> None:
+    if schema_exists(catalog, name):
+        print(f"[schema] {catalog}.{name} already exists"); return
+    _req("POST", "/schemas", {"name": name, "catalog_name": catalog, "comment": comment})
+    print(f"[schema] created {catalog}.{name}")
+
+
+def main() -> int:
+    print(f"Phase 1 bootstrap → {UC_SERVER_URL}\n")
+    print("Waiting for Unity Catalog to be reachable...")
+    wait_for_uc()
+    print("✓ Unity Catalog responding\n")
+
+    create_catalog(CATALOG_NAME, CATALOG_COMMENT)
+    for schema_name, schema_comment in SCHEMAS:
+        create_schema(CATALOG_NAME, schema_name, schema_comment)
+
+    print("\n=== Verification ===")
+    catalogs = _req("GET", "/catalogs").get("catalogs", [])
+    if not [c for c in catalogs if c.get("name") == CATALOG_NAME]:
+        print(f"✗ catalog {CATALOG_NAME} not visible in /catalogs listing"); return 2
+
+    schemas = _req("GET", f"/schemas?catalog_name={CATALOG_NAME}").get("schemas", [])
+    schema_names = {s.get("name") for s in schemas}
+    expected = {name for name, _ in SCHEMAS}
+    missing = expected - schema_names
+    if missing:
+        print(f"✗ missing schemas: {sorted(missing)}"); return 2
+
+    print(f"✓ catalog '{CATALOG_NAME}' present")
+    print(f"✓ {len(expected)} schemas present: {sorted(expected)}\n")
+    print("Phase 1 init complete. Tables will be created by the worker on first write.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except UCError as e:
+        print(f"ERROR: {e}", file=sys.stderr); sys.exit(1)
+UC_INIT_EOF
+
+chmod +x openclaw/uc_init.py
+echo -e "${GREEN}✅ openclaw/uc_init.py created${NC}"
+
+# -----------------------------------------------------------------------------
 # STEP 5: GENERATE HARDENED DOCKERFILE
 # -----------------------------------------------------------------------------
 echo -e "${YELLOW}🐳 Generating openclaw/Dockerfile.hardened...${NC}"
@@ -928,6 +1308,22 @@ GITHUB_TOKEN=ghp_your_github_token_here
 # Sign up: https://aistudio.google.com/app/apikey
 # -----------------------------------------------------------------------------
 GEMINI_API_KEY=your_gemini_api_key_here
+
+# -----------------------------------------------------------------------------
+# DATABRICKS OSS STACK (Phase 1 sidecars — populated after sidecars.sh + uc_init.py)
+# -----------------------------------------------------------------------------
+# Unity Catalog OSS server (sidecar on openclaw-net)
+UC_SERVER_URL=http://unity-catalog:8080
+UC_CATALOG=research
+
+# MLflow tracking server (sidecar on openclaw-net)
+MLFLOW_TRACKING_URI=http://mlflow-server:5000
+MLFLOW_EXPERIMENT_NAME=openclaw-research
+
+# Cryptographic salt for the integrity chain (Phase 2.5 — generate a 64-char hex)
+# Generate once with: python3 -c "import secrets; print(secrets.token_hex(32))"
+# Once set, do NOT rotate without a planned salt-rotation procedure.
+SECRET_SALT=replace_with_secrets_token_hex_32
 
 # -----------------------------------------------------------------------------
 # OPENCLAW CONFIGURATION

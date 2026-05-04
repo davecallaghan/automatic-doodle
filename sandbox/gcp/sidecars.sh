@@ -1,0 +1,131 @@
+#!/bin/bash
+# =============================================================================
+# OPENCLAW SIDECARS — Phase 1 of the Databricks OSS Stack
+# =============================================================================
+# Starts Unity Catalog OSS and MLflow tracking servers as Docker sidecars on
+# the GCP VM. Both bind to 127.0.0.1 only — accessible from the host (and
+# from the openclaw container via the openclaw-net Docker network) but never
+# from outside the VM.
+#
+# Idempotent: safe to run multiple times. Skips containers already running.
+#
+# Run: ./sidecars.sh
+# Requires: docker, /mnt/disks/research mounted
+# =============================================================================
+
+set -euo pipefail
+
+UC_IMAGE="unitycatalog/unitycatalog:latest"
+MLFLOW_IMAGE="ghcr.io/mlflow/mlflow:latest"
+RESEARCH_DISK="/mnt/disks/research"
+NETWORK_NAME="openclaw-net"
+
+# -----------------------------------------------------------------------------
+# Pre-flight
+# -----------------------------------------------------------------------------
+if ! mountpoint -q "$RESEARCH_DISK"; then
+    echo "ERROR: $RESEARCH_DISK is not mounted. Run setup.sh first."
+    exit 1
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: docker not installed. Run setup.sh first."
+    exit 1
+fi
+
+echo "Phase 1: starting Databricks OSS sidecars"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Network: shared bridge for openclaw + sidecars
+# -----------------------------------------------------------------------------
+if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+    echo "[net] $NETWORK_NAME already exists"
+else
+    docker network create --driver bridge "$NETWORK_NAME"
+    echo "[net] created $NETWORK_NAME"
+fi
+
+# -----------------------------------------------------------------------------
+# Persistent disk layout for sidecars
+# -----------------------------------------------------------------------------
+mkdir -p "$RESEARCH_DISK/unity_catalog/etc"
+mkdir -p "$RESEARCH_DISK/delta"
+mkdir -p "$RESEARCH_DISK/mlflow/mlruns"
+mkdir -p "$RESEARCH_DISK/mlflow/artifacts"
+chmod 750 "$RESEARCH_DISK/unity_catalog" "$RESEARCH_DISK/delta" "$RESEARCH_DISK/mlflow"
+echo "[disk] sidecar directories present under $RESEARCH_DISK"
+
+# -----------------------------------------------------------------------------
+# Unity Catalog OSS server
+# -----------------------------------------------------------------------------
+if docker ps --format '{{.Names}}' | grep -q "^unity-catalog$"; then
+    echo "[uc] unity-catalog already running"
+else
+    docker rm -f unity-catalog >/dev/null 2>&1 || true
+    docker run -d \
+        --name unity-catalog \
+        --network="$NETWORK_NAME" \
+        --restart unless-stopped \
+        -p 127.0.0.1:8080:8080 \
+        -v "$RESEARCH_DISK/unity_catalog/etc:/home/unitycatalog/etc" \
+        -v "$RESEARCH_DISK/delta:/home/unitycatalog/etc/data" \
+        --memory=512m \
+        --cpus=0.5 \
+        "$UC_IMAGE" \
+        bin/start-uc-server
+    echo "[uc] unity-catalog started on 127.0.0.1:8080"
+fi
+
+# -----------------------------------------------------------------------------
+# MLflow tracking server
+# -----------------------------------------------------------------------------
+if docker ps --format '{{.Names}}' | grep -q "^mlflow-server$"; then
+    echo "[mlflow] mlflow-server already running"
+else
+    docker rm -f mlflow-server >/dev/null 2>&1 || true
+    docker run -d \
+        --name mlflow-server \
+        --network="$NETWORK_NAME" \
+        --restart unless-stopped \
+        -p 127.0.0.1:5000:5000 \
+        -v "$RESEARCH_DISK/mlflow:/mlflow" \
+        --memory=256m \
+        --cpus=0.5 \
+        "$MLFLOW_IMAGE" \
+        mlflow server \
+            --backend-store-uri /mlflow/mlruns \
+            --default-artifact-root /mlflow/artifacts \
+            --host 0.0.0.0 \
+            --port 5000
+    echo "[mlflow] mlflow-server started on 127.0.0.1:5000"
+fi
+
+# -----------------------------------------------------------------------------
+# Health probes — give services a few seconds to start
+# -----------------------------------------------------------------------------
+echo ""
+echo "Waiting up to 30s for services to respond..."
+for i in $(seq 1 30); do
+    uc_ok=0; mlflow_ok=0
+    curl -fsS -m 2 http://localhost:8080/api/2.1/unity-catalog/catalogs >/dev/null 2>&1 && uc_ok=1 || true
+    curl -fsS -m 2 http://localhost:5000/health >/dev/null 2>&1 && mlflow_ok=1 || true
+    if [ $uc_ok -eq 1 ] && [ $mlflow_ok -eq 1 ]; then
+        break
+    fi
+    sleep 1
+done
+
+echo ""
+echo "=== Sidecar Status ==="
+[ $uc_ok -eq 1 ]     && echo "✓ Unity Catalog responding at http://localhost:8080" \
+                     || echo "✗ Unity Catalog not responding (check: docker logs unity-catalog)"
+[ $mlflow_ok -eq 1 ] && echo "✓ MLflow responding at http://localhost:5000" \
+                     || echo "✗ MLflow not responding (check: docker logs mlflow-server)"
+
+if [ $uc_ok -eq 0 ] || [ $mlflow_ok -eq 0 ]; then
+    exit 1
+fi
+
+echo ""
+echo "Next: run 'python3 ~/openclaw/uc_init.py' to bootstrap the research catalog."
