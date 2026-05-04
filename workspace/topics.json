@@ -1,0 +1,48 @@
+{
+  "research_interests": [
+    {
+      "id": "ai-safety",
+      "name": "AI Safety & Alignment",
+      "group": "AI Ethics",
+      "focus": "Long-term AI safety research",
+      "priority": "high",
+      "keywords": ["alignment", "interpretability", "AI safety", "AGI"]
+    },
+    {
+      "id": "db-tech",
+      "name": "Databricks & Unity Catalog",
+      "group": "Data Infrastructure",
+      "focus": "Enterprise data lakehouse architecture",
+      "priority": "medium",
+      "keywords": ["Databricks", "Unity Catalog", "Delta Lake", "data governance"]
+    },
+    {
+      "id": "llm-models",
+      "name": "Small Language Models (SLMs)",
+      "group": "AI Models",
+      "focus": "Efficient on-device AI models",
+      "priority": "medium",
+      "keywords": ["SLM", "Phi-3", "Gemma", "on-device AI", "quantization"]
+    },
+    {
+      "id": "dev-tools",
+      "name": "Developer Tooling & DevX",
+      "group": "Software Engineering",
+      "focus": "Next-generation developer experience",
+      "priority": "low",
+      "keywords": ["DevX", "IDE", "code assistants", "debugging tools"]
+    }
+  ],
+  "research_frameworks": {
+    "regenerative": true,
+    "epistemic_virtue": true,
+    "cite_sources": true,
+    "bias_awareness": true
+  },
+  "output_preferences": {
+    "format": "markdown",
+    "citation_style": "inline",
+    "export_to_public": true,
+    "max_summary_length": 500
+  }
+}
