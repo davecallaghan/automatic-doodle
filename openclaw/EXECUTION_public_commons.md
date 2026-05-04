@@ -46,7 +46,7 @@ So the answer is **both**: Delta Sharing for the live structured audit, GitHub-p
 
 ## What Gets Shared, Concretely
 
-Three tables exposed as a Delta Share named `openclaw_public_commons`:
+Five views exposed as a Delta Share named `openclaw_public_commons`:
 
 ### 1. `published_briefs`
 
@@ -117,6 +117,56 @@ The `give_back_ratio` is the headline metric. It's deliberately not "tokens cons
 
 The honest version of this metric exposes the failure modes too: `briefs_rejected` and `briefs_drafted` (drafts that never got promoted) are both AI consumption that didn't produce public value. They get counted in the denominator anyway. That's the whole point — the ratio is meaningful precisely because it includes the misses.
 
+### 4. `published_run_summaries`
+
+Per-brief MLflow run details — the "how this specific brief was produced" view. Strengthens the reproducibility claim by linking each published brief to the exact model run that generated it.
+
+This requires a small extension to Phase 3: in addition to logging metrics to MLflow, the worker writes a parallel row to `research.gold.run_summaries` (Delta) so the data is queryable via the share endpoint, not only via the MLflow UI.
+
+```sql
+-- Underlying gold table (added to Phase 3 scope)
+CREATE TABLE research.gold.run_summaries (
+  run_summary_id        STRING NOT NULL,
+  mlflow_run_id         STRING NOT NULL,
+  brief_id              STRING NOT NULL,        -- FK to silver.validated_briefs
+  started_at            TIMESTAMP NOT NULL,
+  ended_at              TIMESTAMP NOT NULL,
+  model_id              STRING NOT NULL,        -- e.g. "google/gemini-2.5-flash"
+  prompt_version        STRING NOT NULL,
+  agent_version         STRING NOT NULL,
+  input_tokens          BIGINT NOT NULL,
+  output_tokens         BIGINT NOT NULL,
+  total_cost_usd        DOUBLE NOT NULL,
+  source_count          INT NOT NULL,
+  unique_domain_count   INT NOT NULL,
+  latency_seconds       DOUBLE NOT NULL,
+  retry_count           INT NOT NULL
+) USING DELTA;
+
+-- Public-facing view: only runs that produced a published brief
+CREATE VIEW research.shared.published_run_summaries AS
+SELECT rs.*
+FROM research.gold.run_summaries rs
+INNER JOIN research.public_archive.published pa
+  ON rs.brief_id = pa.summary_id;
+```
+
+### 5. `retractions`
+
+Mirrors retractions from the GitHub repo (see "Retractions" section below) so recipients querying via Delta Sharing see the same retraction status that GitHub readers see.
+
+```sql
+CREATE TABLE research.shared.retractions (
+  retraction_id         STRING NOT NULL,
+  published_id          STRING NOT NULL,        -- which brief is retracted
+  retracted_at          TIMESTAMP NOT NULL,     -- git commit timestamp
+  retraction_reason     STRING NOT NULL,        -- from commit message body
+  retracted_by          STRING NOT NULL,        -- git author
+  superseded_by         STRING,                 -- optional: replacement published_id
+  git_commit_sha        STRING NOT NULL         -- back-pointer to the commit
+) USING DELTA;
+```
+
 ---
 
 ## Where the AI Usage Numbers Come From
@@ -160,23 +210,27 @@ df = delta_sharing.load_as_pandas(f"{profile}#openclaw.shared.ai_usage_ledger")
 df.groupby("period_start")[["briefs_published", "estimated_cost_usd"]].sum()
 ```
 
-### Surface 2: Public GitHub repo (human-readable)
+### Surface 2: Public GitHub repo (human-readable + retraction mechanism)
 
-For readers who just want the briefs.
+For readers who just want the briefs — and the channel through which David retracts entries (see "Retractions" below).
 
 ```
 Repo: github.com/davecallaghan/openclaw-public-commons
 Contents:
-  briefs/<YYYY-MM>/<topic>-<published_id>.md     # one file per published brief
-  scorecards/<YYYY-MM>/<topic>-<published_id>.json  # corresponding fairness scorecard
-  ledger/<YYYY-MM>.md                            # monthly AI usage rollup, human-formatted
-  README.md                                       # explains the project, license, link to share endpoint
-  ATTRIBUTION.md                                  # how to cite
+  briefs/<YYYY-MM>/<topic>-<published_id>.md          # one file per published brief
+  scorecards/<YYYY-MM>/<topic>-<published_id>.json    # corresponding fairness scorecard
+  runs/<YYYY-MM>/<topic>-<published_id>.json          # MLflow run summary for that brief
+  ledger/<YYYY-MM>.md                                 # monthly AI usage rollup, human-formatted
+  README.md                                            # explains the project, license, share endpoint
+  ATTRIBUTION.md                                       # how to cite
 ```
 
-Populated by a scheduled job (`openclaw/github_publisher.py`) that runs nightly: queries the share views, exports new PROMOTED briefs as markdown files, commits and pushes. The same `content_hash` from the Delta row is included in the markdown frontmatter, so a reader can cross-check the markdown against the share endpoint and confirm they got the same thing.
+Populated by a scheduled job (`openclaw/github_publisher.py`) that runs nightly and is **bidirectional**:
 
-This is the **durable** copy — if the GCP VM disappears tomorrow, the published commons survives in GitHub.
+- **Push:** queries the share views for new PROMOTED briefs, exports as markdown, commits and pushes. The same `content_hash` from the Delta row is included in the markdown frontmatter so a reader can cross-check the markdown against the share endpoint and confirm they got the same content.
+- **Pull:** scans recent commits on the public repo for the `retraction:` prefix pattern (see below), parses the structured fields, inserts rows into `research.shared.retractions` so the Delta endpoint reflects the same retraction state.
+
+This is the **durable** copy — if the GCP VM disappears tomorrow, the published commons survives in GitHub, and so does the retraction history.
 
 ### Surface 3: Status page (the proportionality story, at a glance)
 
@@ -189,6 +243,75 @@ A static HTML page (Cloud Run or GitHub Pages) that pulls from the share endpoin
 - Last 10 published briefs (links to GitHub markdown)
 
 Refreshes on a cron. Public, no auth. The point is to make the take/give story visible at a glance to anyone who wants to spot-check the project's claims about itself.
+
+---
+
+## Retractions — Git as the Mechanism, Delta as the Mirror
+
+A retraction is fundamentally a human judgment ("we got this wrong"). It shouldn't require a schema migration or a CLI dance. The simplest mechanism that fits the architecture: **a retraction is a git commit with a structured pattern, and the publisher mirrors it back into Delta.**
+
+### Mechanics
+
+David retracts via a single commit on the public GitHub repo. The commit:
+
+1. Modifies the published markdown file by inserting a retraction header at the top
+2. Uses a structured commit message: `retraction: <published_id> — <one-line reason>` followed by a body with details
+3. Optionally links to a superseding brief
+
+Example commit message:
+```
+retraction: pub-3a7c — pricing claim was outdated by one quarter
+
+The brief at briefs/2026-05/databricks-pricing-3a7c.md cited e2-medium at
+$0.033/hour, which was the 2026-Q1 figure. Correct as of 2026-Q2: $0.034/hour.
+A revised brief is published at pub-7e2f.
+
+superseded-by: pub-7e2f
+```
+
+Modified markdown file gets a header that preserves the original content:
+```markdown
+> **RETRACTED 2026-05-15** — pricing claim was outdated. See pub-7e2f.
+> Original content preserved below for audit purposes.
+
+# [original brief content unchanged]
+```
+
+### Why this works
+
+- **No schema dance for David.** Retracting is one commit. He's a software engineer; git is the tool he already uses.
+- **Git history is the audit trail.** The diff shows what was added (the retraction header); the commit message has the structured reason; the author is logged with timestamp.
+- **Original content preserved.** The retraction adds a header but doesn't delete the body. Readers can still see what was originally claimed and why it was wrong.
+- **Public from day one.** The retraction is visible to anyone reading the GitHub repo before it ever syncs back to Delta.
+- **Reuses an existing channel.** The publisher already has GitHub write access; pulling commits back is just a `git log --grep="^retraction:"` parser.
+
+### The Delta mirror
+
+The bidirectional publisher's pull pass parses retraction commits and writes to `research.shared.retractions`:
+
+```python
+# Pseudocode for the parser
+for commit in repo.iter_commits(since=last_sync_time):
+    if commit.message.startswith("retraction:"):
+        published_id = parse_published_id(commit.message)
+        reason = parse_reason(commit.message)
+        superseded_by = parse_superseded_by(commit.message)  # optional
+        insert_retraction_row(
+            published_id=published_id,
+            retracted_at=commit.committed_datetime,
+            retraction_reason=reason,
+            retracted_by=commit.author.email,
+            superseded_by=superseded_by,
+            git_commit_sha=commit.hexsha,
+        )
+```
+
+Recipients querying via Delta Sharing see retractions in the structured table; recipients reading GitHub see the retraction headers in the markdown. Both are authoritative for their respective audiences. They will briefly disagree (within the daily sync window) — document this expectation.
+
+### What this doesn't try to solve
+
+- **It doesn't undo the original publication.** If the original brief was already mirrored downstream by a recipient who then republished it, the retraction can't reach that copy. That's a property of CC BY 4.0 — downstream copies are out of our control. The best we can do is publish the retraction loudly and timestamp it.
+- **It doesn't prevent a malicious retraction.** A compromised git PAT could mass-retract everything. Mitigation: branch protection on the public repo, GitHub email notifications on every commit so unauthorized retractions are noticed quickly. The integrity chain (see `EXECUTION_integrity_engine.md`) gives independent detection: a forged retraction on git doesn't alter the integrity chain on the VM, so a chain re-verification spots the divergence.
 
 ---
 
@@ -268,14 +391,14 @@ That query, against an open endpoint, is the answer to "is this project being fa
 
 ---
 
-## Open Questions Before Building
+## Open Questions — Resolutions
 
-1. **Domain and TLS.** Need a domain (e.g. `openclaw.dev` or a subdomain of an existing one) for the public share endpoint. Caddy can auto-provision Let's Encrypt certs cheaply, but that's a setup item.
+1. **Access methods (API / MCP / Website / Git / combination).** **Deferred** until Phase 6 has produced something viewable. Decision will be made looking at real outputs, not in advance. The architecture supports all of them — the share endpoint, GitHub repo, and status page can each be wrapped as an MCP server, exposed as a REST API, or left as-is depending on what audience emerges.
 
-2. **Cost ceiling for public egress.** Open public reads are unbounded. A CDN in front (Cloudflare free tier should handle this) caps the realistic cost, but worth a hard egress alert at, say, $10/month above current baseline.
+2. **Cost ceiling for public egress.** **Resolved.** Egress and overall cost will be aggressively managed via CDN caching, billing alerts, and operational discipline — same approach that's already keeping the project under $15/month. Not blocking.
 
-3. **What about MLflow run history?** The current plan exposes aggregated AI usage but not individual MLflow runs. Worth considering a `published_run_summaries` view that links each published brief to its MLflow run params/metrics — strengthens the reproducibility claim. Defer to Phase 6.5 if scope creep concern.
+3. **MLflow run visibility.** **Resolved by including a fourth shared view** (`published_run_summaries`, see schema above). Each published brief is linked to its full run record — model, prompt version, token counts, latency, retry count. This requires a small extension to Phase 3 (the worker writes to `research.gold.run_summaries` in addition to MLflow's native store) so the data is queryable via the share endpoint, not only via the MLflow UI.
 
-4. **How to handle retracted briefs.** If a published brief turns out to be wrong, the right move is a new row marking it retracted with reason — not a delete. Need to add `retraction_status` and `retracted_reason` columns to `published_briefs` view. Treats retractions as first-class commons contributions, which is itself a fairness property.
+4. **Retractions.** **Resolved by the Retractions section above** — git commit is the mechanism, Delta mirror is the byproduct. No schema columns added to `published_briefs`; instead a separate `research.shared.retractions` view recipients can join against. Markdown gets a retraction header preserving original content.
 
-5. **Cadence of GitHub publishes vs. share endpoint.** The share endpoint is live (always current); GitHub is the durable record (daily snapshot). They will briefly disagree (within the day). Document this expectation in the README.
+5. **Cadence of GitHub publishes vs. share endpoint.** Share endpoint is live (current to the last successful Delta write); GitHub is the durable daily snapshot. They will briefly disagree within the sync window. Document in the public repo README so recipients know which to trust for which use case (live data → share endpoint; durable record → GitHub).

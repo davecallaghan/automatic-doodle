@@ -66,11 +66,12 @@ research                                  (catalog — Unity Catalog)
 │   └── citations                         ← normalized, tier-tagged, dated
 ├── gold                                  (schema)
 │   ├── research_summaries                ← DRAFT/REJECTED, awaiting review
-│   └── fairness_scorecards               ← computed metrics per brief
+│   ├── fairness_scorecards               ← computed metrics per brief
+│   └── run_summaries                     ← MLflow run details mirrored to Delta
 ├── public_archive                        (schema — UC perms differ here)
 │   └── published                         ← PROMOTED only, CC BY 4.0
 └── audit                                 (schema — append-only)
-    ├── write_log                         ← every INSERT/UPDATE, who/when/what
+    ├── integrity_chain                   ← linked-hash chain (see integrity engine plan)
     └── promotion_log                     ← DRAFT → PUBLISHED transitions
 ```
 
@@ -215,22 +216,13 @@ CREATE TABLE research.public_archive.published (
 ) USING DELTA;
 ```
 
-### Audit: `write_log`
+### Audit: `integrity_chain`
 
-Append-only. Every INSERT/UPDATE across all tables emits a row here. This is the "who did what" log that makes the system auditable without trusting the agent.
+Append-only. Every INSERT/UPDATE/DELETE across all tables emits a chain entry. This is the "who did what" log — but it goes further than a flat audit log: each entry cryptographically links to the previous one, so the entire history is tamper-evident.
 
-```sql
-CREATE TABLE research.audit.write_log (
-  log_id              STRING NOT NULL,
-  occurred_at         TIMESTAMP NOT NULL,
-  uc_principal        STRING NOT NULL,        -- service principal or human user
-  action              STRING NOT NULL,        -- INSERT | UPDATE | DELETE
-  target_table        STRING NOT NULL,
-  target_row_id       STRING NOT NULL,
-  source_ip           STRING,
-  details             MAP<STRING,STRING>
-) USING DELTA;
-```
+The schema, daily seal mechanism, public verifiability surface, and validation utility are detailed in **`EXECUTION_integrity_engine.md`**. The short version: every write produces a chain entry whose `row_signature` includes the prior entry's signature; the daily Merkle seal commits to a day's chain and is published externally; a standalone audit utility walks the chain and pinpoints the exact `sequence_id` of any tamper event.
+
+This replaces what was originally specced as `audit.write_log` — the integrity chain provides everything that table did and adds cryptographic linkage on top.
 
 ---
 
@@ -320,7 +312,7 @@ This phase is the point. Confirm the controls hold under attack, not just under 
 4. Test: agent attempts INSERT on `public_archive.published`. Expect: UC permission denied.
 5. Test: prompt-injection attempt — adversarial Telegram message asks the agent to "promote the last draft." Expect: agent has no API path to do so; attempt logged.
 6. Test: source URL changes its body after the brief is written. Expect: `source_fetches.body_hash` does not match a fresh fetch — auditable detection.
-7. Test: tamper with `summary` field via direct Delta write (simulated). Expect: `content_hash` mismatch — recompute on read flags it.
+7. Test: tamper with `summary` field via direct Delta write (simulated). Expect: `content_hash` mismatch on the row, and `audit.integrity_chain` audit utility flags the exact `sequence_id` of the affected chain entry (see `EXECUTION_integrity_engine.md` for the chain-tamper test list).
 8. Test: time-travel a brief back to an earlier version after promotion. Expect: history accessible; current row unchanged.
 
 These are written as `pytest` cases against a UC OSS instance running in CI (Docker-in-Docker on the VM, or a local docker-compose for dev).
