@@ -1,6 +1,8 @@
 # OpenClaw Hardened Agency v4.0 - Deployment Checklist
 
-Use this checklist to ensure a complete, secure deployment.
+End-to-end runbook covering every component of the platform in the order you would deploy them. The first five phases get OpenClaw running on a hardened GCP VM with Telegram + Gemini. Phases 6 onward layer the Databricks OSS stack (Unity Catalog, MLflow, Delta, integrity chain, public commons) on top of that working agent.
+
+Phases 1–6 are deployable today. Phases 7–12 are planned and have full design specs in `openclaw/EXECUTION_*.md`; their runbook sections will replace the placeholders here as each phase is implemented.
 
 ---
 
@@ -467,6 +469,207 @@ If multiple people will manage this:
  Grant IAM roles to team members (minimum: Compute Viewer + IAP User)
  Share emergency contact info
  Schedule quarterly secrets rotation with team calenda
+
+---
+
+## ☑️ PHASE 6: DATABRICKS OSS STACK — SIDECARS + CATALOG BOOTSTRAP (15 minutes)
+
+This phase adds Unity Catalog OSS and MLflow tracking server as Docker sidecars on the existing VM, and bootstraps the `research` catalog. **Purely additive** — the running OpenClaw container is not touched. Phase 7 will join the agent to the new sidecar network and wire the worker.
+
+**Plan refs:** `openclaw/EXECUTION_databricks_integration.md` (master), Phase 1 of that document.
+
+### Prerequisites
+- [ ] Phases 1–5 complete; OpenClaw container is up and Telegram bot is responding
+- [ ] VM is `e2-standard-2` (or larger). Verify with:
+      ```bash
+      gcloud compute instances describe openclaw-secure-node \
+        --zone=us-east4-a --format="value(machineType.basename())"
+      ```
+      If still on `e2-medium`, bump first:
+      ```bash
+      oc-stop
+      gcloud compute instances set-machine-type openclaw-secure-node \
+        --machine-type=e2-standard-2 --zone=us-east4-a --project=orphansinthedesert
+      oc-start
+      ```
+- [ ] GCP budget alert raised from $20 → $30 (the VM bump adds ~$8/month if applicable)
+
+### Step 32: Pull the Databricks scripts onto the VM
+From your Mac, push the three Phase 6 artifacts:
+```bash
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  sandbox/gcp/sidecars.sh \
+  openclaw/uc_init.py \
+  openclaw/unity_catalog_setup.sql \
+  openclaw-secure-node:~/openclaw/
+```
+Or, if the repo is cloned on the VM:
+```bash
+oc-ssh
+cd ~/automatic-doodle && git fetch origin && git checkout databrick_init
+```
+
+### Step 33: Start the sidecars
+On the VM:
+```bash
+~/openclaw/sidecars.sh
+# Or: ~/automatic-doodle/sandbox/gcp/sidecars.sh
+```
+Expected final lines:
+```
+✓ Unity Catalog responding at http://localhost:8080
+✓ MLflow responding at http://localhost:5000
+```
+
+If either fails, inspect logs and re-run after fixing:
+```bash
+docker logs unity-catalog
+docker logs mlflow-server
+```
+Common gotchas:
+- **UC image tag drift.** `unitycatalog/unitycatalog:latest` and the `bin/start-uc-server` entrypoint are the current convention but should be cross-checked against the upstream release if startup fails.
+- **Memory pressure on `e2-medium`.** Sidecars use ~768 MB combined; the agent uses 1.8 GB. Bump to `e2-standard-2` if you skipped the prerequisite.
+
+### Step 34: Bootstrap the research catalog
+On the VM:
+```bash
+python3 ~/openclaw/uc_init.py
+```
+Expected:
+```
+[catalog] created research
+[schema] created research.bronze
+[schema] created research.silver
+[schema] created research.gold
+[schema] created research.public_archive
+[schema] created research.audit
+✓ catalog 'research' present
+✓ 5 schemas present: ['audit', 'bronze', 'gold', 'public_archive', 'silver']
+Phase 1 init complete. Tables will be created by the worker on first write.
+```
+Re-running is safe — every step is idempotent.
+
+### Step 35: (Optional) Open the MLflow UI
+```bash
+# From your Mac, alongside oc-tunnel on 18789:
+gcloud compute ssh openclaw-secure-node \
+  --tunnel-through-iap --zone=us-east4-a --project=orphansinthedesert \
+  -- -L 5000:localhost:5000 -N
+# Visit: http://localhost:5000
+```
+The UI will be empty until Phase 9 begins logging runs. This step just confirms the server renders.
+
+### Step 36: Capture state and snapshot
+```bash
+# On the VM: capture catalog state for the operational record
+docker exec unity-catalog \
+  curl -s http://localhost:8080/api/2.1/unity-catalog/catalogs | python3 -m json.tool
+
+# From your Mac: snapshot the disk now that UC + MLflow data exists on it
+oc-snapshot
+```
+
+### Phase 6 Sign-off
+- [ ] `sidecars.sh` ran cleanly; both health checks pass
+- [ ] `uc_init.py` reports the `research` catalog and 5 schemas present
+- [ ] MLflow UI loads via SSH port forward
+- [ ] OpenClaw container still responsive (Telegram ping returns)
+- [ ] Disk snapshot taken
+- [ ] Budget alert raised to $30/month
+
+When all six are checked, Phase 6 is complete. Open a Phase 7 branch (`databricks_integrity_engine`) for the next build.
+
+### Phase 6 rollback
+```bash
+docker stop unity-catalog mlflow-server
+docker rm unity-catalog mlflow-server
+docker network rm openclaw-net
+# Persistent disk data is preserved at /mnt/disks/research/{unity_catalog,mlflow,delta}/.
+# Delete those dirs only for a clean slate; otherwise sidecars.sh picks them back up.
+```
+
+### Phase 6 cost impact
+| Item | Before | After | Delta |
+|---|---|---|---|
+| VM compute (8h/day weekdays) | $8.09/mo (e2-medium) | $16.18/mo (e2-standard-2) | +$8.09 |
+| Persistent disk (50 GB) | $5.00/mo | $5.00/mo | — |
+| Cloud NAT + egress | ~$1.73/mo | ~$1.73/mo | — |
+| **Total target** | **~$14.82/mo** | **~$22.91/mo** | **+$8.09/mo** |
+
+If the VM was already on `e2-standard-2` (current Phase 1 checkpoint says it is), Phase 6 is **+$0/mo** — sidecars run on RAM and disk you've already paid for.
+
+---
+
+## ☑️ PHASE 7: DATABRICKS WORKER — BRONZE/SILVER WRITES (planned)
+
+**Status:** Designed, not yet implemented.
+**Plan ref:** `openclaw/EXECUTION_databricks_integration.md` Phase 2.
+
+What this phase does: introduces `openclaw/databricks_worker.py` so every research response the agent produces is written to bronze (`raw_responses`, `source_fetches`) and silver (`validated_briefs`, `citations`) Delta tables under the `research` catalog. Adds `deltalake`, `mlflow`, `pyarrow` to `requirements.txt` and rebuilds the container. Joins the `openclaw` container to `openclaw-net`. Adds `LocalBuffer` for offline failsafe writes to `/home/clawuser/workspace/research_logs/` when UC is unreachable.
+
+Runbook will be added here when the phase is implemented.
+
+---
+
+## ☑️ PHASE 8: INTEGRITY ENGINE — GENESIS + CHAIN + DAILY SEAL (planned)
+
+**Status:** Designed, not yet implemented.
+**Plan ref:** `openclaw/EXECUTION_integrity_engine.md`.
+
+What this phase does: introduces `openclaw/integrity_engine.py` (linked-hash chain with SHA-256, daily Merkle seal at 4:55 PM EDT, salt-based signing) and `openclaw/integrity_cli.py` (`init`, `audit`, `seal` commands). Generates `SECRET_SALT`, writes the genesis block, hooks `ChainWriter` into every Phase 7 worker write so each operational table change produces a chain entry. Replaces the flat `audit.write_log` (never created) with `audit.integrity_chain`.
+
+This phase **must precede or accompany** any code path that writes to the operational tables. In practice, Phase 7 and Phase 8 can be built in either order, but neither should be deployed without the other.
+
+Runbook will be added here when the phase is implemented. Will include `SECRET_SALT` generation, genesis bootstrap, chain audit verification.
+
+---
+
+## ☑️ PHASE 9: FAIRNESS SCORECARD + MLflow TRACKING (planned)
+
+**Status:** Designed, not yet implemented.
+**Plan ref:** `openclaw/EXECUTION_databricks_integration.md` Phase 3, plus the fairness threshold table in that doc.
+
+What this phase does: computes a six-metric fairness scorecard for every brief (source-tier distribution, vendor diversity, counter-argument ratio, recency, paid-content disclosure, bias-checklist completeness), writes it to `gold.fairness_scorecards`, and routes briefs to `DRAFT` or `REJECTED` based on the threshold table. Logs every research run to MLflow with parameters, metrics, and artifacts. Writes a parallel row to `gold.run_summaries` so run details are queryable via SQL, not only via the MLflow UI.
+
+Runbook will be added here when the phase is implemented.
+
+---
+
+## ☑️ PHASE 10: PROMOTION CLI + PERMISSION ENFORCEMENT (planned)
+
+**Status:** Designed, not yet implemented.
+**Plan ref:** `openclaw/EXECUTION_databricks_integration.md` Phase 4.
+
+What this phase does: introduces `openclaw/promote.py` — a CLI that reviews DRAFT briefs and promotes approved ones into `public_archive.published`. Authenticates as the `david` UC principal (separate token, not in the agent container's env). Applies the full UC permission model: agent service principal has INSERT on bronze/silver/gold but no access to `public_archive`; `david` is the only principal that can promote. Promotion is an atomic UPDATE on `gold.research_summaries` plus INSERT on `public_archive.published`, written to `audit.promotion_log` with override reasons recorded.
+
+Runbook will be added here when the phase is implemented.
+
+---
+
+## ☑️ PHASE 11: ADVERSARIAL VALIDATION SUITE (planned)
+
+**Status:** Designed, not yet implemented.
+**Plan refs:** `openclaw/EXECUTION_databricks_integration.md` Phase 5 (operational invariants); `openclaw/EXECUTION_integrity_engine.md` (chain-tamper invariants).
+
+What this phase does: introduces `openclaw/tests/test_adversarial.py` — a pytest suite that confirms each enforcement boundary holds under attack, not just under happy-path use. Tests include rejected briefs with empty counter-arguments, agent attempts to UPDATE `gold.research_summaries`, agent attempts to INSERT into `public_archive`, prompt-injection promotion attempts via Telegram, source-page tampering detection, content-hash mismatch detection, time-travel verification, and the full chain-tamper test list (content edit, row deletion, sequence reorder, daily seal forgery, genesis tamper, salt unavailable, replay).
+
+Runbook will be added here when the phase is implemented.
+
+---
+
+## ☑️ PHASE 12: PUBLIC COMMONS — DELTA SHARING + GITHUB ARCHIVE (planned)
+
+**Status:** Designed, not yet implemented.
+**Plan ref:** `openclaw/EXECUTION_public_commons.md`.
+
+What this phase does: makes the audit trail publicly queryable. Adds a `delta-sharing-server` sidecar exposing five curated views (`published_briefs`, `published_fairness_scorecards`, `ai_usage_ledger`, `published_run_summaries`, `retractions`) over the open Delta Sharing protocol. Adds `openclaw/github_publisher.py` for bidirectional sync with a public GitHub repo (push promoted briefs as markdown; pull retraction commits back into Delta). Adds `openclaw/ledger_rollup.py` that computes daily AI-usage rollups (token counts, cost, give-back ratio). Publishes daily Merkle seals to a public `SEALS.md` file so external observers can verify the integrity chain without access to `SECRET_SALT`. Optional static status page surfaces the proportionality story at a glance.
+
+This is the only phase that introduces an intentionally public surface; threat model and egress cost discipline are documented in the plan.
+
+Runbook will be added here when the phase is implemented.
+
+---
 
 ### Daily Operations
 
