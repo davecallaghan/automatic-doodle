@@ -492,7 +492,19 @@ This phase adds Unity Catalog OSS and MLflow tracking server as Docker sidecars 
         --machine-type=e2-standard-2 --zone=us-east4-a --project=orphansinthedesert
       oc-start
       ```
-- [ ] GCP budget alert raised from $20 → $30 (the VM bump adds ~$8/month if applicable)
+- [ ] GCP budget alert raised from $20 → $30 (the VM bump adds ~$8/month if applicable):
+      ```bash
+      # Find the billing account and budget ID
+      BILLING=$(gcloud beta billing projects describe orphansinthedesert \
+        --format="value(billingAccountName)" | sed 's|billingAccounts/||')
+      BUDGET_ID=$(gcloud beta billing budgets list --billing-account="$BILLING" \
+        --filter="displayName:'OpenClaw Monthly Budget'" \
+        --format="value(name.basename())")
+
+      # Raise the cap to $30 (threshold rules at 50%/90%/100% are preserved)
+      gcloud beta billing budgets update "$BUDGET_ID" \
+        --billing-account="$BILLING" --budget-amount=30USD
+      ```
 
 ### Step 32: Pull the Databricks scripts onto the VM
 From your Mac, push the three Phase 6 artifacts:
