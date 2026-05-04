@@ -90,15 +90,11 @@ The seal value is **published externally** (see "Public Verifiability" below). O
 
 ## Schedule Alignment with Existing Infrastructure
 
-The Cryptographer's brief specifies **8 PM EDT** for the daily seal. The existing infrastructure auto-stops the VM at **5 PM EDT** to control cost. Three options:
+**Decision: daily seal fires at 4:55 PM EDT** as the agent's final scheduled action of the research day, immediately before the VM's auto-stop at 5 PM EDT.
 
-| Option | Mechanism | Tradeoff |
-|---|---|---|
-| **A — 4:55 PM EDT seal** (recommended) | Final scheduled action of the research day; agent computes and writes the checkpoint as its last operation before VM stop | Aligns with existing schedule; zero extra cost; "research day" closes 3h earlier than spec but matches actual operating window |
-| B — 8 PM EDT, VM extended | Schedule changes to keep VM running until 8 PM | +$3.20/month compute; honors literal spec |
-| C — 8 PM EDT, Cloud Function | Tiny Cloud Function fires at 8 PM independent of VM; reads Delta state from persistent disk via a service account | More moving parts, ~$0/month; honors literal spec but introduces a second compute path |
+The Cryptographer's original brief specified 8 PM EDT, but in this system the research day genuinely ends at 5 PM — that's when the VM stops to control cost. A seal that commits to "today's actual research" (everything written between 9 AM and 4:55 PM EDT) is more meaningful than a seal at an arbitrary off-hours cutoff. This option costs nothing extra, requires no second compute path, and keeps the integrity engine entirely inside the existing infrastructure boundary.
 
-**Recommendation: Option A.** The 8 PM time was the spec author's framing, but in this system the research day genuinely ends at 5 PM. The seal sealing "today's actual research" is more meaningful than the seal sealing "an arbitrary cutoff time." If you'd rather honor the literal spec, Option C is the cleanest add — note the operational burden and pick deliberately.
+Operationally: the seal is the last operation in the agent's daily lifecycle. The agent's main loop reserves the 4:55 PM window for checkpoint computation and chain commit. If a seal write fails (rare — single writer, append-only), the failure is logged loudly and a retry is attempted on next-day startup before any new chain entries are accepted. A missed seal is recoverable; an unsealed day is detectable.
 
 ---
 
@@ -421,9 +417,10 @@ This work slots in as Phase 2.5 of the master plan — between bronze/silver wri
 ### Phase 2.5c — Daily seal (~2 days)
 
 1. `MerkleTreeBuilder` and `DailySealer` classes.
-2. Schedule the seal as the agent's last action of the research day (~4:55 PM EDT). Implementation: cron entry inside the container or a final-step in the agent's main loop.
+2. Wire the seal as the final action in the agent's daily lifecycle, fired at 4:55 PM EDT. Implementation: a cron entry inside the container (`55 16 * * 1-5 America/New_York`) or — preferred — a scheduled final-step hook in the agent's main loop so the agent is the only thing writing to the chain.
 3. The seal append uses the same `ChainWriter` — it's a CHECKPOINT chain entry like any other.
-4. **Validation:** ten synthetic days of chain entries; run sealer for each day; verify Merkle root recomputable independently.
+4. Recovery path: on next-day startup, before accepting any new chain entries, the agent checks for a missing prior-day CHECKPOINT and writes it retroactively (with `recorded_at` set to the actual write time, but `seal_date` set to the day being sealed). Missed seals are recoverable; unsealed days remain detectable in the audit utility output.
+5. **Validation:** ten synthetic days of chain entries; run sealer for each day; verify Merkle root recomputable independently. Plus: simulate a 4:55 PM seal failure; confirm next-day recovery writes the missing CHECKPOINT correctly.
 
 ### Phase 2.5d — Audit utility (~2 days)
 
