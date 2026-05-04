@@ -361,7 +361,7 @@ init_agency.sh                      ← UPDATED (Phase 1 — UC + MLflow env var
 
 4. **The "REJECTED but human-overrides" path.** Letting David manually promote a fairness-failed brief with `override_reason` is the right call (false positives happen), but it weakens the invariant. Mitigation: every override is itself a metric (`overrides_per_month`) — if the rate creeps up, the thresholds are wrong, not the briefs. This is the fairness self-monitoring loop.
 
-5. **Public archive is local-disk only.** A regenerative commons that lives on one VM's persistent disk isn't really a commons. Phase 6 (out of scope here) is publishing `public_archive.published` to a public GitHub repo via a scheduled job — that's where CC BY 4.0 actually means something.
+5. **Public archive is local-disk only.** A regenerative commons that lives on one VM's persistent disk isn't really a commons. Phase 6 — detailed in `EXECUTION_public_commons.md` — adds Delta Sharing for the structured audit data and a GitHub-backed durable archive for the human-readable briefs. That's the phase where CC BY 4.0 actually means something, and where the proportionality argument ("share back in proportion to AI consumed") becomes a measurable, queryable property.
 
 ---
 
