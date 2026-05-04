@@ -38,7 +38,7 @@ gcloud beta billing projects describe orphansinthedesert
 ## ☑️ PHASE 1: Local Setup (10 minutes)
 ### Step 1: Initialize Project
 ```bash
-cd ~/Projects/openclaw-agency-v4
+cd ~/automatic-doodle   # or wherever you cloned the repo
 ./init_agency.sh
 ```
 Expected output: "ALL SCRIPTS GENERATED SUCCESSFULLY"
@@ -64,7 +64,7 @@ Verification:
 ## ☑️ PHASE 2: GCP Infrastructure (15 minutes)
 ### Step 4: Provision VM
 ```bash
-cd infra
+cd sandbox/gcp
 ./provision.sh
 ```
 Expected output: "VM provisioning complete"
@@ -103,28 +103,32 @@ gcloud compute resource-policies list
 ##  PHASE 3: VM Configuration (20 minutes)
 ### Step 7: Copy Files to VM
 ```bash
-# From ~/Projects/openclaw-agency/
 gcloud compute ssh openclaw-secure-node --zone=us-east4-a --tunnel-through-iap \
-    --command="mkdir -p ~/instance"
+    --command="mkdir -p ~/openclaw/workspace"
 
-gcloud compute scp instance/Dockerfile.hardened openclaw-secure-node:~/instance/ \
-    --zone=us-east4-a --tunnel-through-iap
-
-gcloud compute scp instance/Dockerfile.hardened openclaw-secure-node:~/instance/ \
+gcloud compute scp openclaw/Dockerfile.hardened openclaw-secure-node:~/openclaw/ \
   --zone=us-east4-a \
   --tunnel-through-iap
 
-gcloud compute scp instance/setup.sh openclaw-secure-node:~/instance/ \
+gcloud compute scp openclaw/setup.sh openclaw-secure-node:~/openclaw/ \
+  --zone=us-east4-a \
+  --tunnel-through-iap
+
+gcloud compute scp openclaw/workspace/topics.json openclaw-secure-node:~/openclaw/workspace/ \
+  --zone=us-east4-a \
+  --tunnel-through-iap
+
+gcloud compute scp openclaw/workspace/virtue_prompt.md openclaw-secure-node:~/openclaw/workspace/ \
   --zone=us-east4-a \
   --tunnel-through-iap
 ```
 Alternative: SSH and paste content manually
 ```bash
 oc-ssh
-mkdir -p ~/instance
-nano ~/instance/Dockerfile.hardened  # Paste content
-nano ~/instance/setup.sh              # Paste content
-chmod +x ~/instance/setup.sh
+mkdir -p ~/openclaw/workspace
+nano ~/openclaw/Dockerfile.hardened  # Paste content
+nano ~/openclaw/setup.sh             # Paste content
+chmod +x ~/openclaw/setup.sh
 ```
 
 ### Step 8: SSH into VM
@@ -152,7 +156,7 @@ sudo cat /var/log/startup-script.log
 ### Step 10: Run Setup Script
 ```bash
 # Inside VM:
-cd ~/instance
+cd ~/openclaw
 ./setup.sh
 ```
 Expected duration: 5-8 minutes (Docker install + image build)
@@ -563,7 +567,7 @@ Run this checklist on the 1st of each month:
  Check snapshot count: gcloud compute snapshots list
  Delete snapshots >90 days old
  Review error logs: docker logs openclaw --since 30d | grep ERROR
-- [ ] Update Docker image: `docker pull ghcr.io/openclaw/openclaw:latest && cd ~/instance && ./setup.sh`
+- [ ] Update Docker image: `docker pull ghcr.io/openclaw/openclaw:latest && cd ~/openclaw && ./setup.sh`
 - [ ] Verify schedule still active: `gcloud compute resource-policies describe openclaw-day-shift --region=us-east4`
 - [ ] Check disk usage trend: `df -h /mnt/disks/research` (project if >80% full)
 - [ ] Test backup restore: Create test VM from latest snapshot
@@ -589,7 +593,7 @@ oc-ssh
 nano /mnt/disks/research/.secrets/.env
 # Replace all tokens
 # NOTE: docker restart does NOT re-read --env-file. Must stop+rm+rerun.
-docker stop openclaw && docker rm openclaw && ~/instance/setup.sh
+docker stop openclaw && docker rm openclaw && ~/openclaw/setup.sh
 ```
 
 ### 2. Audit Access Logs
@@ -619,7 +623,7 @@ docker exec openclaw apt-get upgrade -s | grep -i security
 
 # Rebuild image with latest base
 oc-ssh
-cd ~/instance
+cd ~/openclaw
 docker pull ghcr.io/openclaw/openclaw:latest
 docker build --no-cache -t openclaw-hardened -f Dockerfile.hardened .
 docker stop openclaw && docker rm openclaw && ./setup.sh

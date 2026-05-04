@@ -140,26 +140,25 @@ gcloud compute ssh openclaw-secure-node \
   -- -vvv
 ```
 
-### Create IAP Tunnel for Web Access
+### Create SSH Port Forward for Web Access
 ```bash
-# Tunnel port 18789 to localhost (OpenClaw web interface)
-gcloud compute start-iap-tunnel openclaw-secure-node 18789 \
-  --local-host-port=localhost:18789 \
+# Forward port 18789 to localhost via IAP SSH (OpenClaw web interface)
+# Note: Docker binds to 127.0.0.1 — IAP TCP tunnel cannot reach it; SSH port forward works
+gcloud compute ssh openclaw-secure-node \
+  --tunnel-through-iap \
   --zone=us-east4-a \
-  --project=orphansinthedesert
-
-# Tunnel with custom local port (if 18789 is busy)
-gcloud compute start-iap-tunnel openclaw-secure-node 18789 \
-  --local-host-port=localhost:8080 \
-  --zone=us-east4-a
+  --project=orphansinthedesert \
+  -- -L 18789:localhost:18789 -N
 
 # Keep tunnel running in background (macOS/Linux)
-nohup gcloud compute start-iap-tunnel openclaw-secure-node 18789 \
-  --local-host-port=localhost:18789 \
-  --zone=us-east4-a &
+gcloud compute ssh openclaw-secure-node \
+  --tunnel-through-iap \
+  --zone=us-east4-a \
+  --project=orphansinthedesert \
+  -- -L 18789:localhost:18789 -N &
 
 # Find and kill background tunnel
-ps aux | grep iap-tunnel
+ps aux | grep "18789:localhost"
 kill <PID>
 ```
 
@@ -263,7 +262,7 @@ docker rm openclaw
 docker rmi openclaw-hardened
 
 # Rebuild using Dockerfile
-cd ~/instance
+cd ~/openclaw
 docker build -t openclaw-hardened -f Dockerfile.hardened .
 
 # Re-run setup script to start new container
@@ -878,7 +877,7 @@ gcloud compute instances delete openclaw-secure-node \
   --keep-disks=boot
 
 # 3. Re-run provision script to create new VM
-cd ~/Projects/openclaw-agency-v4/infra
+cd ~/sandbox/gcp
 ./provision.sh
 
 # NOTE: New VM will auto-mount existing disk via startup script
@@ -1025,7 +1024,7 @@ docker logs openclaw -f
 ### Custom Docker Build
 ```bash
 # Inside VM: Modify Dockerfile
-cd ~/instance
+cd ~/openclaw
 nano Dockerfile.hardened
 
 # Make your changes, then rebuild
@@ -1495,7 +1494,7 @@ gcloud compute machine-types list --zones=us-east4-a
 
 # OpenClaw shortcuts
 alias oc-ssh='gcloud compute ssh openclaw-secure-node --project=orphansinthedesert --zone=us-east4-a --tunnel-through-iap'
-alias oc-tunnel='gcloud compute start-iap-tunnel openclaw-secure-node 18789 --local-host-port=localhost:18789 --zone=us-east4-a --project=orphansinthedesert'
+alias oc-tunnel='gcloud compute ssh openclaw-secure-node --tunnel-through-iap --zone=us-east4-a --project=orphansinthedesert -- -L 18789:localhost:18789 -N'
 alias oc-start='gcloud compute instances start openclaw-secure-node --zone=us-east4-a --project=orphansinthedesert'
 alias oc-stop='gcloud compute instances stop openclaw-secure-node --zone=us-east4-a --project=orphansinthedesert'
 alias oc-status='gcloud compute instances describe openclaw-secure-node --zone=us-east4-a --format="get(status)"'
@@ -1508,7 +1507,7 @@ alias oc-logs='gcloud logging
 
 # OpenClaw shortcuts
 alias oc-ssh='gcloud compute ssh openclaw-secure-node --project=orphansinthedesert --zone=us-east4-a --tunnel-through-iap'
-alias oc-tunnel='gcloud compute start-iap-tunnel openclaw-secure-node 18789 --local-host-port=localhost:18789 --zone=us-east4-a --project=orphansinthedesert'
+alias oc-tunnel='gcloud compute ssh openclaw-secure-node --tunnel-through-iap --zone=us-east4-a --project=orphansinthedesert -- -L 18789:localhost:18789 -N'
 alias oc-start='gcloud compute instances start openclaw-secure-node --zone=us-east4-a --project=orphansinthedesert'
 alias oc-stop='gcloud compute instances stop openclaw-secure-node --zone=us-east4-a --project=orphansinthedesert'
 alias oc-status='gcloud compute instances describe openclaw-secure-node --zone=us-east4-a --format="get(status)"'

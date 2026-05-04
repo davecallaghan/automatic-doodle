@@ -13,7 +13,7 @@
 #   3. Generates networking.sh with firewall + NAT setup
 #   4. Generates schedule.sh with 9AM-5PM auto-start/stop
 #   5. Generates Dockerfile.hardened with security restrictions
-#   6. Generates instance/setup.sh for in-VM Docker deployment
+#   6. Generates openclaw/setup.sh for in-VM Docker deployment
 #   7. Creates sample workspace config files
 #
 # Security Notes:
@@ -40,16 +40,16 @@ echo -e "${GREEN}🚀 Initializing OpenClaw Hardened Agency Directory Structure.
 echo -e "${YELLOW}📁 Creating directories...${NC}"
 
 # Main project directories
-mkdir -p infra instance workspace/{seeds,research_inbox,public_archive}
+mkdir -p sandbox/gcp openclaw/workspace
 
 echo -e "${GREEN}✅ Directory structure created${NC}"
 
 # -----------------------------------------------------------------------------
 # STEP 2: GENERATE INFRASTRUCTURE PROVISIONING SCRIPT
 # -----------------------------------------------------------------------------
-echo -e "${YELLOW}🛠️  Generating infra/provision.sh...${NC}"
+echo -e "${YELLOW}🛠️  Generating sandbox/gcp/provision.sh...${NC}"
 
-cat > infra/provision.sh <<'PROVISION_EOF'
+cat > sandbox/gcp/provision.sh <<'PROVISION_EOF'
 #!/bin/bash
 # =============================================================================
 # GCP INFRASTRUCTURE PROVISIONING SCRIPT v4.0
@@ -304,15 +304,15 @@ echo "   3. SSH into VM: gcloud compute ssh $VM_NAME --zone=$ZONE --tunnel-throu
 echo ""
 PROVISION_EOF
 
-chmod +x infra/provision.sh
-echo -e "${GREEN}✅ infra/provision.sh created${NC}"
+chmod +x sandbox/gcp/provision.sh
+echo -e "${GREEN}✅ sandbox/gcp/provision.sh created${NC}"
 
 # -----------------------------------------------------------------------------
 # STEP 3: GENERATE NETWORKING CONFIGURATION SCRIPT
 # -----------------------------------------------------------------------------
-echo -e "${YELLOW}🌐 Generating infra/networking.sh...${NC}"
+echo -e "${YELLOW}🌐 Generating sandbox/gcp/networking.sh...${NC}"
 
-cat > infra/networking.sh <<'NETWORKING_EOF'
+cat > sandbox/gcp/networking.sh <<'NETWORKING_EOF'
 #!/bin/bash
 # =============================================================================
 # GCP NETWORKING CONFIGURATION SCRIPT v4.0
@@ -482,15 +482,15 @@ echo "   Run: ./schedule.sh"
 echo ""
 NETWORKING_EOF
 
-chmod +x infra/networking.sh
-echo -e "${GREEN}✅ infra/networking.sh created${NC}"
+chmod +x sandbox/gcp/networking.sh
+echo -e "${GREEN}✅ sandbox/gcp/networking.sh created${NC}"
 
 # -----------------------------------------------------------------------------
 # STEP 4: GENERATE SCHEDULING SCRIPT
 # -----------------------------------------------------------------------------
-echo -e "${YELLOW}📅 Generating infra/schedule.sh...${NC}"
+echo -e "${YELLOW}📅 Generating sandbox/gcp/schedule.sh...${NC}"
 
-cat > infra/schedule.sh <<'SCHEDULE_EOF'
+cat > sandbox/gcp/schedule.sh <<'SCHEDULE_EOF'
 #!/bin/bash
 # =============================================================================
 # GCP INSTANCE SCHEDULING SCRIPT v4.0
@@ -619,19 +619,19 @@ echo "     gcloud compute instances add-metadata $VM_NAME --zone=$ZONE \\"
 echo "       --metadata=overtime_active=false"
 echo ""
 echo "✅ Infrastructure provisioning complete!"
-echo "   Next: SSH into VM and run instance/setup.sh"
+echo "   Next: SSH into VM and run openclaw/setup.sh"
 echo ""
 SCHEDULE_EOF
 
-chmod +x infra/schedule.sh
-echo -e "${GREEN}✅ infra/schedule.sh created${NC}"
+chmod +x sandbox/gcp/schedule.sh
+echo -e "${GREEN}✅ sandbox/gcp/schedule.sh created${NC}"
 
 # -----------------------------------------------------------------------------
 # STEP 5: GENERATE HARDENED DOCKERFILE
 # -----------------------------------------------------------------------------
-echo -e "${YELLOW}🐳 Generating instance/Dockerfile.hardened...${NC}"
+echo -e "${YELLOW}🐳 Generating openclaw/Dockerfile.hardened...${NC}"
 
-cat > instance/Dockerfile.hardened <<'DOCKERFILE_EOF'
+cat > openclaw/Dockerfile.hardened <<'DOCKERFILE_EOF'
 # =============================================================================
 # OPENCLAW HARDENED CONTAINER IMAGE v4.0
 # =============================================================================
@@ -756,14 +756,14 @@ CMD ["openclaw", "gateway", "--port", "18789", "--allow-unconfigured"]
 # =============================================================================
 DOCKERFILE_EOF
 
-echo -e "${GREEN}✅ instance/Dockerfile.hardened created${NC}"
+echo -e "${GREEN}✅ openclaw/Dockerfile.hardened created${NC}"
 
 # -----------------------------------------------------------------------------
 # STEP 6: GENERATE INSTANCE SETUP SCRIPT
 # -----------------------------------------------------------------------------
-echo -e "${YELLOW}⚙️  Generating instance/setup.sh...${NC}"
+echo -e "${YELLOW}⚙️  Generating openclaw/setup.sh...${NC}"
 
-cat > instance/setup.sh <<'SETUP_EOF'
+cat > openclaw/setup.sh <<'SETUP_EOF'
 #!/bin/bash
 # =============================================================================
 # INSTANCE SETUP SCRIPT v4.0
@@ -780,7 +780,7 @@ cat > instance/setup.sh <<'SETUP_EOF'
 # Prerequisites:
 #   - VM must be running
 #   - Persistent disk must be mounted at /mnt/disks/research
-#   - You must have the Dockerfile.hardened file in ~/instance/
+#   - You must have the Dockerfile.hardened file in ~/openclaw/
 #
 # Security features applied:
 #   - Read-only root filesystem
@@ -955,14 +955,14 @@ fi
 echo "🏗️  Building hardened Docker image (this may take 3-5 minutes)..."
 
 # Check if Dockerfile exists
-if [ ! -f ~/instance/Dockerfile.hardened ]; then
-    echo "❌ ERROR: Dockerfile.hardened not found in ~/instance/"
+if [ ! -f ~/openclaw/Dockerfile.hardened ]; then
+    echo "❌ ERROR: Dockerfile.hardened not found in ~/openclaw/"
     echo "   Copy it from your local machine using:"
-    echo "   gcloud compute scp Dockerfile.hardened openclaw-secure-node:~/instance/ --zone=us-east4-a --tunnel-through-iap"
+    echo "   gcloud compute scp openclaw/Dockerfile.hardened openclaw-secure-node:~/openclaw/ --zone=us-east4-a --tunnel-through-iap"
     exit 1
 fi
 
-cd ~/instance
+cd ~/openclaw
 
 # Build image with build-time optimizations
 # --no-cache: Force fresh build (use on first run or after Dockerfile changes)
@@ -1236,15 +1236,15 @@ echo "     df -h /mnt/disks/research"
 echo ""
 SETUP_EOF
 
-chmod +x instance/setup.sh
-echo -e "${GREEN}✅ instance/setup.sh created${NC}"
+chmod +x openclaw/setup.sh
+echo -e "${GREEN}✅ openclaw/setup.sh created${NC}"
 
 # -----------------------------------------------------------------------------
 # STEP 7: GENERATE WORKSPACE CONFIGURATION FILES
 # -----------------------------------------------------------------------------
-echo -e "${YELLOW}📝 Generating workspace/topics.json...${NC}"
+echo -e "${YELLOW}📝 Generating openclaw/workspace/topics.json...${NC}"
 
-cat > workspace/topics.json <<'TOPICS_EOF'
+cat > openclaw/workspace/topics.json <<'TOPICS_EOF'
 {
   "research_interests": [
     {
@@ -1295,14 +1295,14 @@ cat > workspace/topics.json <<'TOPICS_EOF'
 }
 TOPICS_EOF
 
-echo -e "${GREEN}✅ workspace/topics.json created${NC}"
+echo -e "${GREEN}✅ openclaw/workspace/topics.json created${NC}"
 
 # -----------------------------------------------------------------------------
 # STEP 8: GENERATE VIRTUE PROTOCOL DOCUMENTATION
 # -----------------------------------------------------------------------------
-echo -e "${YELLOW}📜 Generating workspace/virtue_prompt.md...${NC}"
+echo -e "${YELLOW}📜 Generating openclaw/workspace/virtue_prompt.md...${NC}"
 
-cat > workspace/virtue_prompt.md <<'VIRTUE_EOF'
+cat > openclaw/workspace/virtue_prompt.md <<'VIRTUE_EOF'
 # THE VIRTUE PROTOCOL
 ## Epistemic Guidelines for OpenClaw Research Agent
 
@@ -1506,7 +1506,7 @@ License: CC BY 4.0 (OpenClaw Project)
 
 VIRTUE_EOF
 
-echo -e "${GREEN}✅ workspace/virtue_prompt.md created${NC}"
+echo -e "${GREEN}✅ openclaw/workspace/virtue_prompt.md created${NC}"
 
 echo ""
 echo -e "${GREEN} ════════════════════════════════════════════════════════════════════════${NC}"
@@ -1514,16 +1514,17 @@ echo -e "${GREEN}✅ INITIALIZATION COMPLETE!${NC}"
 echo -e "${GREEN} ════════════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo "📁 Directory structure created:"
-echo "   ├── infra/"
+echo "   ├── sandbox/gcp/"
 echo "   │   ├── provision.sh       (Creates VM + service account)"
 echo "   │   ├── networking.sh      (Sets up IAP + Cloud NAT)"
 echo "   │   └── schedule.sh        (Configures 9AM-5PM auto-start/stop)"
-echo "   ├── instance/"
+echo "   ├── openclaw/"
 echo "   │   ├── Dockerfile.hardened (Secure container image definition)"
-echo "   │   └── setup.sh           (Run inside VM for Docker setup)"
-echo "   └── workspace/"
-echo "       ├── topics.json        (Research interests configuration)"
-echo "       └── virtue_prompt.md   (Epistemic guidelines)"
+echo "   │   ├── setup.sh           (Run inside VM for Docker setup)"
+echo "   │   └── workspace/"
+echo "   │       ├── topics.json        (Research interests configuration)"
+echo "   │       └── virtue_prompt.md   (Epistemic guidelines)"
+echo "   └── local_hardening.sh     (Run once on your Mac)"
 echo ""
 echo "⏭️  NEXT STEPS:"
 echo ""
@@ -1539,7 +1540,7 @@ echo ""
 echo "   ${YELLOW}3. SSH into VM and configure:${NC}"
 echo "      gcloud compute ssh openclaw-secure-node --zone=us-east4-a --tunnel-through-iap"
 echo "      # Inside VM, copy setup.sh and Dockerfile.hardened, then:"
-echo "      cd ~/instance"
+echo "      cd ~/openclaw"
 echo "      ./setup.sh"
 echo ""
 echo "   ${YELLOW}4. Edit secrets (REQUIRED):${NC}"
@@ -1817,13 +1818,13 @@ echo ""
 echo "📦 Package contents:"
 echo "   ✅ init_agency.sh           (this script - master initializer)"
 echo "   ✅ local_hardening.sh       (run first on your Mac)"
-echo "   ✅ infra/provision.sh       (creates GCP VM)"
-echo "   ✅ infra/networking.sh      (sets up IAP + NAT)"
-echo "   ✅ infra/schedule.sh        (9AM-5PM automation)"
-echo "   ✅ instance/Dockerfile.hardened"
-echo "   ✅ instance/setup.sh        (run inside VM)"
-echo "   ✅ workspace/topics.json"
-echo "   ✅ workspace/virtue_prompt.md"
+echo "   ✅ sandbox/gcp/provision.sh       (creates GCP VM)"
+echo "   ✅ sandbox/gcp/networking.sh      (sets up IAP + NAT)"
+echo "   ✅ sandbox/gcp/schedule.sh        (9AM-5PM automation)"
+echo "   ✅ openclaw/Dockerfile.hardened"
+echo "   ✅ openclaw/setup.sh        (run inside VM)"
+echo "   ✅ openclaw/workspace/topics.json"
+echo "   ✅ openclaw/workspace/virtue_prompt.md"
 echo ""
 echo "📊 Estimated monthly cost: \$14.82"
 echo "   - VM (8h/day):     \$8.09"
@@ -1834,9 +1835,9 @@ echo ""
 echo "🚀 Quick start:"
 echo "   1. ./local_hardening.sh"
 echo "   2. source ~/.zshrc  (or restart terminal)"
-echo "   3. cd infra && ./provision.sh && ./networking.sh && ./schedule.sh"
+echo "   3. cd sandbox/gcp && ./provision.sh && ./networking.sh && ./schedule.sh"
 echo "   4. oc-ssh  (uses alias to connect)"
-echo "   5. Inside VM: cd ~/instance && ./setup.sh"
+echo "   5. Inside VM: cd ~/openclaw && ./setup.sh"
 echo ""
 echo "📚 Full documentation:"
 echo "   - README.md           (complete setup guide)"
