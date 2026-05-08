@@ -613,14 +613,125 @@ If the VM was already on `e2-standard-2` (current Phase 1 checkpoint says it is)
 
 ---
 
-## ☑️ PHASE 7: DATABRICKS WORKER — BRONZE/SILVER WRITES (planned)
+## ☑️ PHASE 7: DATABRICKS WORKER — BRONZE/SILVER WRITES (15 minutes)
 
-**Status:** Designed, not yet implemented.
 **Plan ref:** `openclaw/EXECUTION_databricks_integration.md` Phase 2.
 
-What this phase does: introduces `openclaw/databricks_worker.py` so every research response the agent produces is written to bronze (`raw_responses`, `source_fetches`) and silver (`validated_briefs`, `citations`) Delta tables under the `research` catalog. Adds `deltalake`, `mlflow`, `pyarrow` to `requirements.txt` and rebuilds the container. Joins the `openclaw` container to `openclaw-net`. Adds `LocalBuffer` for offline failsafe writes to `/home/clawuser/workspace/research_logs/` when UC is unreachable.
+What this phase does: ships `openclaw/databricks_worker.py` — Python that takes a `RawResponse` / `SourceFetch` / `ValidatedBrief` / `Citation` (Pydantic-validated) and writes it to the corresponding Delta table under `/mnt/disks/research/delta/research/{bronze,silver}/...`. Includes a `LocalBuffer` failsafe (writes JSONL when Delta is unreachable) and a stub `_chain_hook` that logs to stderr for now and will be replaced by Phase 8's real `ChainWriter`.
 
-Runbook will be added here when the phase is implemented.
+**Phase 7 explicitly defers:**
+- **Agent integration.** The worker runs on the VM host, invoked via CLI. Wiring the Node.js OpenClaw gateway to call into Python is a separate architectural decision (add Python to the openclaw container, vs. a separate worker container, vs. a webhook bridge). That decision belongs to a future phase, not Phase 7.
+- **UC table registration.** The worker writes Delta files; UC doesn't yet know the tables exist. SQL access via UC is a Phase 7.5 concern.
+
+### Prerequisites
+- [ ] Phase 6 complete (UC + MLflow sidecars healthy; `research` catalog + 5 schemas registered)
+- [ ] VM has outbound internet (for `pip install`)
+
+### Step 37: Pull Phase 7 files to the VM
+```bash
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/databricks_worker.py \
+  openclaw/requirements.txt \
+  openclaw/__init__.py \
+  openclaw-secure-node:~/openclaw/
+
+gcloud compute scp --recurse \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/tests \
+  openclaw-secure-node:~/openclaw/
+```
+
+### Step 38: Install Python deps on the VM
+```bash
+oc-ssh
+pip install --user -r ~/openclaw/requirements.txt
+
+# Verify:
+python3 -c "import deltalake, pydantic, pyarrow; print('deltalake', deltalake.__version__, '| pydantic', pydantic.__version__, '| pyarrow', pyarrow.__version__)"
+```
+First install pulls ~80 MB of wheels (deltalake's Rust binary + pyarrow). Subsequent runs are cached.
+
+### Step 39: Run the unit test suite on the VM
+```bash
+pip install --user pytest
+cd ~ && python3 -m pytest openclaw/tests/test_databricks_worker.py -v
+```
+Expected: 14 passing.
+
+### Step 40: Ensure the Delta data root is writable
+The worker writes to `/mnt/disks/research/delta/`. UC's data dir is the same path bind-mounted into its container. Confirm the agent's host user can write there:
+```bash
+sudo chown -R 1000:1000 /mnt/disks/research/delta/research 2>/dev/null || true
+sudo mkdir -p /mnt/disks/research/workspace/research_logs
+sudo chown -R "$(id -u):$(id -g)" /mnt/disks/research/workspace/research_logs
+```
+
+### Step 41: Smoke-test bronze write
+```bash
+cat <<'EOF' | python3 ~/openclaw/databricks_worker.py record-response
+{
+  "response_id": "test-resp-001",
+  "created_at": "2026-05-07T22:45:00Z",
+  "agent_version": "openclaw-v4.0",
+  "model_id": "google/gemini-2.5-flash",
+  "prompt_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "response_text": "Phase 7 smoke test response.",
+  "response_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+  "mlflow_run_id": "smoke-run-001",
+  "topic_id": "ai-safety"
+}
+EOF
+```
+Expected stderr line: `CHAIN_HOOK operation=INSERT table=research.bronze.raw_responses row_id=test-resp-001 payload_hash=<64 hex>`
+
+### Step 42: Verify Delta files and round-trip read
+```bash
+ls -la /mnt/disks/research/delta/research/bronze/raw_responses/
+# Expect: _delta_log/ directory plus one or more .parquet files
+
+python3 ~/openclaw/databricks_worker.py read-recent --table bronze.raw_responses --limit 5
+# Expect: JSON array containing the test row written above
+```
+
+### Step 43: LocalBuffer failsafe sanity check
+Force a write failure by pointing the worker at a bad Delta root, then drain:
+```bash
+DELTA_ROOT=/dev/null/intentionally-bad python3 ~/openclaw/databricks_worker.py record-response <<'EOF'
+{"response_id":"buf-001","created_at":"2026-05-07T22:46:00Z","agent_version":"v4.0","model_id":"google/gemini-2.5-flash","prompt_hash":"00...","response_text":"buffered","response_hash":"11...","mlflow_run_id":"r"}
+EOF
+# Expect stderr: "WARN: Delta write failed... buffering to /mnt/disks/research/workspace/research_logs/<date>/..."
+
+ls /mnt/disks/research/workspace/research_logs/$(date -u +%Y-%m-%d)/
+# Expect: bronze__raw_responses.jsonl present
+
+python3 ~/openclaw/databricks_worker.py drain-buffer
+# Expect: "drained 1 rows"
+```
+
+### Phase 7 Sign-off
+- [ ] `pip install -r requirements.txt` completes without errors
+- [ ] All 14 unit tests pass on the VM
+- [ ] Smoke `record-response` writes succeed and emit a `CHAIN_HOOK` line
+- [ ] Delta files visible at `/mnt/disks/research/delta/research/bronze/raw_responses/`
+- [ ] `read-recent` returns the smoke-test row
+- [ ] `LocalBuffer` round-trip works (write-while-broken → drain when fixed)
+- [ ] OpenClaw container still responsive (`docker ps` shows it healthy)
+
+When all seven are checked, Phase 7 is complete. Open a Phase 8 branch (`databricks_integrity_engine`) for the next build — the chain hook stub gets replaced with a real append to `research.audit.integrity_chain`.
+
+### Phase 7 rollback
+The worker is purely additive — running it does not modify the OpenClaw container or any Phase 6 sidecar. To roll back:
+```bash
+# Optionally remove smoke-test rows by deleting the test Delta tables
+sudo rm -rf /mnt/disks/research/delta/research/bronze/raw_responses
+sudo rm -rf /mnt/disks/research/workspace/research_logs/$(date -u +%Y-%m-%d)
+# Uninstall Python deps (rarely needed):
+pip uninstall -y deltalake pyarrow pydantic
+```
+
+### Phase 7 cost impact
+**$0/mo.** Worker runs on existing VM compute; Delta files share the existing 50 GB persistent disk. No new GCP resources.
 
 ---
 

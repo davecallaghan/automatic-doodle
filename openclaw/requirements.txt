@@ -1,0 +1,5 @@
+# OpenClaw worker — Phase 7+
+# Install on the VM with: pip install --user -r ~/openclaw/requirements.txt
+deltalake>=0.18.0,<1.0
+pydantic>=2.5,<3.0
+pyarrow>=15.0
