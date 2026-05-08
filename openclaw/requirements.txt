@@ -3,3 +3,5 @@
 deltalake>=0.18.0,<1.0
 pydantic>=2.5,<3.0
 pyarrow>=15.0
+# Phase 9 — must match the MLflow server version pinned in sandbox/gcp/sidecars.sh
+mlflow>=2.16.0,<3.0

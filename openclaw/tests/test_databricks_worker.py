@@ -182,6 +182,105 @@ def test_chain_hook_stub_logs_to_stderr(capsys, tmp_path):
     assert "payload_hash=abc123" in captured.err
 
 
+class _FakeDelta:
+    """A complete-enough stand-in for DeltaTableWriter — satisfies all the
+    attribute access the worker does after a successful append.
+    """
+    catalog = "research"
+
+    def __init__(self):
+        self.writes: list[tuple[str, str, list[dict]]] = []
+
+    def append(self, schema, table, rows):
+        self.writes.append((schema, table, rows))
+
+    def path_for(self, schema, table):
+        return f"/tmp/fake-delta/{schema}/{table}"
+
+
+def test_record_validated_brief_phase7_only_writes_silver(tmp_path):
+    """Phase 7 contract: with no fairness_scorer, only silver tables are written."""
+    from openclaw.databricks_worker import (
+        Citation, DatabricksWorker, LocalBuffer, ValidatedBrief,
+    )
+    from datetime import datetime, timezone
+
+    fake = _FakeDelta()
+    w = DatabricksWorker(
+        delta_writer=fake,
+        local_buffer=LocalBuffer(root=tmp_path),
+        chain_writer=False,
+        fairness_scorer=None,
+        mlflow_tracker=None,
+    )
+    brief = ValidatedBrief(
+        brief_id="b-1", response_id="r-1",
+        created_at=datetime.now(timezone.utc),
+        topic_id="t", title="x", key_findings="y",
+        counter_arguments="x" * 100,
+        practical_implications="z", further_reading="w",
+        content_hash="h", agent_version="v",
+    )
+    citation = Citation(
+        citation_id="c-1", brief_id="b-1", url="https://x", title="t",
+        authority_tier=1, vendor_org="A", is_paid_content=False,
+    )
+    result = w.record_validated_brief(brief, [citation])
+
+    assert result == {}
+    written_tables = [(s, t) for s, t, _ in fake.writes]
+    assert ("silver", "validated_briefs") in written_tables
+    assert ("silver", "citations") in written_tables
+    assert not any(s == "gold" for s, _ in written_tables)
+
+
+def test_record_validated_brief_phase9_writes_gold(tmp_path):
+    """With fairness_scorer wired, gold tables are also written and a status returned."""
+    from openclaw.databricks_worker import (
+        Citation, DatabricksWorker, LocalBuffer, ValidatedBrief,
+    )
+    from openclaw.fairness_scorer import BiasChecklist, FairnessScorer
+    from datetime import datetime, timezone
+
+    fake = _FakeDelta()
+    w = DatabricksWorker(
+        delta_writer=fake,
+        local_buffer=LocalBuffer(root=tmp_path),
+        chain_writer=False,
+        fairness_scorer=FairnessScorer(now=datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc)),
+        mlflow_tracker=None,
+    )
+    brief = ValidatedBrief(
+        brief_id="b-1", response_id="r-1",
+        created_at=datetime.now(timezone.utc),
+        topic_id="t", title="x", key_findings="y",
+        counter_arguments=" ".join(["counter"] * 30),
+        practical_implications="z", further_reading="w",
+        content_hash="h", agent_version="v",
+    )
+    citations = [
+        Citation(
+            citation_id=f"c-{i}", brief_id="b-1", url=f"https://x/{i}", title="t",
+            authority_tier=1, vendor_org=v, is_paid_content=False,
+            publication_date=datetime(2026, 5, 7).date(),
+        )
+        for i, v in enumerate(["A", "B", "C"])
+    ]
+    bias = BiasChecklist(
+        only_confirming_sources="No", competing_perspectives_included="Yes",
+        limitations_acknowledged="Yes", financial_incentive_disclosed="Yes",
+        publication_date_checked="Yes",
+    )
+
+    result = w.record_validated_brief(brief, citations, bias_check=bias)
+
+    assert "scorecard" in result
+    assert result["status"] in ("DRAFT", "REJECTED")
+    written_tables = {(s, t) for s, t, _ in fake.writes}
+    assert ("gold", "fairness_scorecards") in written_tables
+    assert ("gold", "research_summaries") in written_tables
+
+
 def test_chain_hook_calls_writer_when_wired(monkeypatch):
     """When chain_writer is provided, the hook delegates to it instead of
     logging to stderr.

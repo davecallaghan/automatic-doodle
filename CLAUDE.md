@@ -2,53 +2,109 @@
 
 ## What This Project Is
 
-A cost-optimized, security-hardened AI research agent running on Google Cloud Platform. The project deploys an [OpenClaw](https://ghcr.io/openclaw/openclaw) agent container inside a hardened GCP VM with zero public internet exposure. The agent runs 9AM–5PM EST daily (~$14.82/month) and is accessible only via IAP tunnel.
+A cost-optimized, security-hardened AI research agent on GCP, built up in twelve phases. Phases 1–6 are deployed and running; Phases 7–9 have code shipped on dedicated branches and a runbook for deployment; Phases 10–12 are designed but not yet coded. The agent runs 9 AM–5 PM EST weekdays, accessible only via IAP tunnel.
 
 The GitHub repo name ("automatic-doodle") was auto-assigned and kept — it fits.
+
+---
+
+## Phase Overview
+
+| # | Phase | Status |
+|---|---|---|
+| 1 | Local setup (init_agency.sh, local_hardening.sh) | ✅ deployed |
+| 2 | GCP infra (provision, networking, schedule) | ✅ deployed |
+| 3 | VM configuration (disk mount, setup.sh) | ✅ deployed |
+| 4 | Secrets configuration (.env populated) | ✅ deployed |
+| 5 | OpenClaw access & testing (Telegram + Gemini) | ✅ deployed |
+| 6 | Databricks sidecars + Unity Catalog bootstrap | ✅ deployed |
+| 7 | Databricks worker (bronze + silver Delta writes) | 🟢 code on `databricks_worker` branch |
+| 8 | Integrity engine (linked-hash chain + Merkle seal) | 🟢 code on `databricks_integrity_engine` branch |
+| 9 | Fairness scorecard + MLflow tracking | 🟢 code on `databricks_fairness_scorecard` branch |
+| 10 | Promotion CLI + permission enforcement | 📋 planned |
+| 11 | Adversarial validation suite | 📋 planned |
+| 12 | Public commons (Delta Sharing + GitHub) | 📋 planned |
+
+The single source of truth for deployment is [Deployment_Checklist.md](Deployment_Checklist.md) — top-to-bottom runbook covering every component in deployment order.
 
 ---
 
 ## Architecture Overview
 
 ```
-Mac (gcloud CLI + IAP SSH tunnel)
-  │
-  │  IAP-only SSH  (35.235.240.0/20 → port 22)
+Mac (gcloud CLI + IAP SSH tunnels)
+  │  IAP-only SSH (35.235.240.0/20 → port 22)
   ▼
-GCP VM: openclaw-secure-node (e2-medium, us-east4-a, NO public IP)
+GCP VM: openclaw-secure-node (e2-standard-2, us-east4-a, NO public IP)
   │
-  │  Startup script mounts persistent disk
+  │  Persistent boot disk = research disk (50 GB pd-balanced, auto-delete=no)
   ▼
-/mnt/disks/research/  (50GB pd-balanced, auto-delete=NO)
-  ├── .openclaw/      → /home/clawuser/.openclaw  (agent config + model auth)
-  ├── workspace/      → /home/clawuser/workspace
-  ├── logs/           → /home/clawuser/logs
-  ├── vector_db/      → /home/clawuser/vector_db
-  └── .secrets/.env   → loaded via --env-file (read-only)
+/mnt/disks/research/   ← single persistent disk, NOT a separate mount
+  ├── workspace/                 → /home/clawuser/workspace (research outputs)
+  │   └── research_logs/         → LocalBuffer JSONL failsafe (Phase 7+)
+  ├── logs/, vector_db/, .openclaw/, .secrets/.env
+  ├── delta/                     ← Delta tables under research catalog (Phase 7+)
+  │   └── research/{bronze,silver,gold,public_archive,audit}/...
+  ├── unity_catalog/db/          ← UC OSS H2 metadata (Phase 6)
+  ├── mlflow/{mlruns,artifacts,mlflow.db}  ← MLflow tracking (Phase 6)
+  └── audit/genesis.json         ← integrity chain anchor (Phase 8)
   │
   ▼
-Docker container: openclaw (hardened image)
-  - Read-only root filesystem
-  - Non-root user: 1000:1000 (clawuser), HOME=/home/clawuser
-  - Capabilities: CHOWN + DAC_OVERRIDE only (ALL others dropped)
-  - Port 127.0.0.1:18789 (localhost only — access via SSH port forward)
-  - RAM: 1.8GB limit  CPU: 1.8 cores  PIDs: 100 max
+Docker containers on `openclaw-net` bridge network:
+  - openclaw           ← hardened: read-only FS, non-root 1000:1000, port 18789
+  - unity-catalog      ← UC OSS sidecar, port 8080 (127.0.0.1 only)
+  - mlflow-server      ← MLflow v2.16.0 + sqlite, port 5000 (127.0.0.1 only)
 ```
 
-**Outbound internet**: VM uses Cloud NAT (outbound-only, no inbound) for API calls (Telegram, Exa, GitHub, Docker pulls).
+**Outbound internet**: Cloud NAT (outbound-only). Sidecars are 127.0.0.1-bound; access from Mac via SSH port forward.
 
 ---
 
-## Two-Layer Structure
+## Two-Layer + Application-Code Structure
 
-This repo is split into two composable layers:
+```
+automatic-doodle/
+├── CLAUDE.md, README.md, Deployment_Checklist.md, MANUAL_COMMANDS.md
+├── init_agency.sh                 ← source-of-truth generator for shell + small Python
+├── local_hardening.sh
+│
+├── sandbox/                       ← Cloud infra (host-agnostic)
+│   ├── README.md
+│   └── gcp/                       ← GCP implementation
+│       ├── provision.sh           Phase 1
+│       ├── networking.sh          Phase 1
+│       ├── schedule.sh            Phase 1
+│       └── sidecars.sh            Phase 6 (UC + MLflow + openclaw-net)
+│
+└── openclaw/                      ← Application code
+    ├── README.md, Dockerfile.hardened, setup.sh
+    ├── workspace/{topics.json, virtue_prompt.md}
+    │
+    ├── PLAN_databricks_integration.md         ← original spec
+    ├── EXECUTION_databricks_integration.md    ← master execution plan (Phases 1–6)
+    ├── EXECUTION_integrity_engine.md          ← Phase 8 design
+    ├── EXECUTION_public_commons.md            ← Phase 12 design
+    │
+    ├── unity_catalog_setup.sql    ← Phase 6: canonical schema reference
+    ├── uc_init.py                 ← Phase 6: bootstrap catalog + 5 schemas
+    ├── databricks_worker.py       ← Phase 7: bronze/silver writes + (Phase 9) gold
+    ├── integrity_engine.py        ← Phase 8: chain + genesis + Merkle seal + audit CLI
+    ├── fairness_scorer.py         ← Phase 9: deterministic 6-metric scoring
+    ├── mlflow_tracker.py          ← Phase 9: MLflow client wrapper
+    ├── requirements.txt           ← Python deps (deltalake, pydantic, pyarrow, mlflow)
+    ├── __init__.py
+    └── tests/                     ← pytest suite, 88 tests, all pure-Python
+        ├── test_databricks_worker.py
+        ├── test_integrity_engine.py
+        ├── test_fairness_scorer.py
+        └── test_mlflow_tracker.py
+```
 
-| Layer | Directory | Purpose |
-|---|---|---|
-| Sandbox | `sandbox/gcp/` | GCP cloud infrastructure — VM, disk, IAP, NAT, schedule |
-| Application | `openclaw/` | Docker container, agent setup, workspace config |
+### Source of truth
 
-Each layer has its own README with its interface contract. The sandbox layer is cloud-provider-agnostic by design; `sandbox/README.md` defines what any cloud implementation must provide.
+`init_agency.sh` is the source of truth for **shell scripts and small config files** (`sidecars.sh`, `unity_catalog_setup.sql`, `uc_init.py`). It writes them via heredocs. **If a bug exists in those generated files, fix it in `init_agency.sh` and regenerate — never patch the generated file directly.**
+
+For the larger Python application code (Phases 7–9 — `databricks_worker.py`, `integrity_engine.py`, `fairness_scorer.py`, `mlflow_tracker.py` and their tests), the heredoc pattern is brittle for ~300+ line files; those live as ordinary source files and are maintained directly.
 
 ---
 
@@ -57,47 +113,14 @@ Each layer has its own README with its interface contract. The sandbox layer is 
 | Resource | Name | Notes |
 |---|---|---|
 | Project | `orphansinthedesert` | |
-| VM | `openclaw-secure-node` | e2-medium, us-east4-a |
-| Disk | `openclaw-secure-node` | 50GB pd-balanced, `auto-delete=no` |
+| VM | `openclaw-secure-node` | **e2-standard-2** (bumped from e2-medium for Phase 6 sidecar headroom) |
+| Disk | `openclaw-secure-node` | 50 GB pd-balanced, `auto-delete=no` — single disk doubles as boot + research |
 | Service Account | `openclaw-agent-v3@orphansinthedesert.iam.gserviceaccount.com` | logWriter + metricWriter only |
-| Firewall | `allow-ssh-iap` | IAP range → port 22, targets SA |
-| Firewall | `allow-openclaw-web-iap` | IAP range → port 18789, tag-based |
-| Router | `openclaw-router` | us-east4 |
+| Firewall | `allow-ssh-iap`, `allow-openclaw-web-iap` | IAP range only |
+| Router | `openclaw-router` (us-east4) | |
 | NAT | `openclaw-nat` | 64 ports/VM (cost-optimized) |
-| Schedule | `openclaw-day-shift` | 9AM–5PM EST, America/New_York |
-
----
-
-## Directory Structure
-
-```
-automatic-doodle/
-├── CLAUDE.md                        # This file
-├── README.md                        # Full setup guide
-├── MANUAL_COMMANDS.md               # Operational commands reference
-├── Deployment_Checklist.md          # Step-by-step deployment checklist
-├── init_agency.sh                   # Master init script — source of truth for all generated files
-├── local_hardening.sh               # Mac-side gcloud hardening + shell aliases
-│
-├── sandbox/                         # Cloud infrastructure layer (host-agnostic)
-│   ├── README.md                    # Sandbox interface contract
-│   └── gcp/                         # GCP implementation
-│       ├── provision.sh             # Creates VM, service account, persistent disk
-│       ├── networking.sh            # IAP firewall rules, Cloud NAT
-│       └── schedule.sh              # 9AM–5PM auto start/stop policy
-│
-└── openclaw/                        # Application layer (Docker-agnostic)
-    ├── README.md                    # OpenClaw interface contract
-    ├── Dockerfile.hardened          # Hardened container image
-    ├── setup.sh                     # In-VM: builds image, writes env, starts container
-    └── workspace/
-        ├── topics.json              # Research topic configuration
-        └── virtue_prompt.md         # Epistemic guidelines for the agent
-```
-
-### Source of truth
-
-`init_agency.sh` generates all files under `sandbox/` and `openclaw/`. **If a bug exists in a generated file, fix it in `init_agency.sh` and regenerate — never patch the generated file directly.**
+| Schedule | `openclaw-day-shift` | 9 AM–5 PM EST, weekdays |
+| Snapshot | latest: `openclaw-20260507-2108-phase6` | post-Phase-6 baseline |
 
 ---
 
@@ -108,85 +131,91 @@ automatic-doodle/
 | IAM | `logging.logWriter` + `monitoring.metricWriter` only |
 | OAuth scopes | `logging.write` + `monitoring.write` only |
 | Firewall targeting | SSH rule targets service account; web rule is tag-based |
-| Container filesystem | Read-only (`--read-only`) |
-| Capabilities | ALL dropped, add back CHOWN + DAC_OVERRIDE |
-| User | 1000:1000 (non-root), explicit HOME=/home/clawuser |
+| Container filesystem | Read-only (`--read-only`) on openclaw |
+| Capabilities | ALL dropped on openclaw, plus CHOWN + DAC_OVERRIDE |
+| User | openclaw runs 1000:1000 (non-root); UC sidecar runs uid 100 (unitycatalog) |
 | Secrets mount | Read-only (`:ro`) |
-| Disk format guard | Checks `blkid` first, only formats blank disks |
+| Public network exposure | None — sidecars and gateway all bind 127.0.0.1 |
+| **Integrity chain (Phase 8)** | Every state-changing write produces an append-only chain entry whose row_signature = SHA-256(payload_hash ‖ prev_hash ‖ SECRET_SALT). Tamper detection is precise to the exact `sequence_id`. |
+| **Fairness gating (Phase 9)** | Briefs failing any of six thresholds land as `status='REJECTED'` with the failure list recorded. Agent cannot self-promote. |
 
 ---
 
-## Agent Integrations (Secrets in `/mnt/disks/research/.secrets/.env`)
+## Agent Integrations (`/mnt/disks/research/.secrets/.env`)
 
-| Service | Purpose | Key Name |
+| Service | Purpose | Key |
 |---|---|---|
-| Telegram | Chat interface to agent | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
+| Telegram | Chat interface | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
 | Gemini | AI model provider | `GEMINI_API_KEY` |
-| Exa | Web search API | `EXA_API_KEY` |
+| Exa | Web search | `EXA_API_KEY` |
 | GitHub | Repo read access | `GITHUB_PAT` |
+| Unity Catalog | Catalog server URL | `UC_SERVER_URL=http://unity-catalog:8080` |
+| MLflow | Tracking server URL | `MLFLOW_TRACKING_URI=http://mlflow-server:5000` |
+| Integrity chain | Cryptographic salt | `SECRET_SALT` (64 hex chars; **back up to password manager**) |
 
-**Model**: `google/gemini-2.5-flash` — configured via `openclaw models auth login --provider google` (auto-detects `GEMINI_API_KEY`).
+**Model**: `google/gemini-2.5-flash`.
 
 ---
 
 ## Research Configuration
 
-**Topics** (`openclaw/workspace/topics.json`):
-- AI Safety & Alignment (high priority)
-- Databricks & Unity Catalog (medium)
-- Small Language Models / on-device AI (medium)
-- Developer Tooling & DevX (low)
+**Topics** (`openclaw/workspace/topics.json`): AI Safety & Alignment (high), Databricks & Unity Catalog (medium), Small Language Models (medium), Developer Tooling (low).
 
-**Virtue Protocol** (`openclaw/workspace/virtue_prompt.md`) — enforces:
-1. Devil's Advocate: every brief must include counter-arguments
-2. Authority Ranking: tier sources (Tier 1 = docs/papers → Tier 4 = SEO spam)
-3. Regenerative Export: publish sanitized summaries to `/public_archive` under CC BY 4.0
-4. Bias Awareness: check for confirmation bias, vendor incentives, recency bias
+**Virtue Protocol** (`openclaw/workspace/virtue_prompt.md`):
+1. Devil's Advocate: counter-arguments mandatory
+2. Authority Ranking: tier 1 (docs/papers) → tier 4 (SEO spam)
+3. Regenerative Export: CC BY 4.0 publishing to `/public_archive`
+4. Bias Awareness: 5-question checklist
+
+Phase 9 turns each of these from advisory text into measurable, queryable properties — `gold.fairness_scorecards` records the score per brief; `gold.research_summaries.status` blocks promotion if any threshold fails.
 
 ---
 
 ## Common Operations
 
 ```bash
-# SSH into VM
+# SSH + tunnels
 oc-ssh
-# or:
-gcloud compute ssh openclaw-secure-node --project=orphansinthedesert --zone=us-east4-a --tunnel-through-iap
+gcloud compute ssh openclaw-secure-node --tunnel-through-iap --zone=us-east4-a \
+  --project=orphansinthedesert -- -L 18789:localhost:18789 -L 5000:localhost:5000 -N
+# Then: http://localhost:18789 (gateway), http://localhost:5000 (MLflow UI)
 
-# Web UI tunnel (SSH port forward — IAP TCP tunnel doesn't work with 127.0.0.1 bind)
-oc-tunnel
-# or:
-gcloud compute ssh openclaw-secure-node --tunnel-through-iap --zone=us-east4-a --project=orphansinthedesert -- -L 18789:localhost:18789 -N
-# Then visit: http://localhost:18789
-
-# VM start/stop
-oc-start  /  oc-stop  /  oc-status
-
-# Inside VM: container management
-docker ps
+# Container management (inside VM)
+docker ps                            # all three containers
 docker logs openclaw -f
-docker restart openclaw
-docker stats openclaw --no-stream
+docker logs unity-catalog -f
+docker logs mlflow-server -f
 
-# Emergency VM stop (cost bleed)
-gcloud compute instances stop openclaw-secure-node --zone=us-east4-a --project=orphansinthedesert
+# Sidecars (Phase 6, idempotent)
+~/openclaw/sidecars.sh
 
-# Create snapshot backup
-oc-snapshot
+# Catalog state (Phase 6)
+python3 ~/openclaw/uc_init.py
+
+# Worker CLI (Phase 7+)
+python3 ~/openclaw/databricks_worker.py read-recent --table bronze.raw_responses
+python3 ~/openclaw/databricks_worker.py drain-buffer
+
+# Integrity engine (Phase 8)
+python3 ~/openclaw/integrity_engine.py status
+python3 ~/openclaw/integrity_engine.py audit
+python3 ~/openclaw/integrity_engine.py seal     # daily 4:55 PM EDT via cron
+
+# VM lifecycle
+oc-start  /  oc-stop  /  oc-status  /  oc-snapshot
 ```
 
 ---
 
 ## Cost Budget
 
-**Target: ~$14.82/month** (budget alert at $20/month)
+**Target: ~$22.91/month** (budget alert at $30/month).
 
-| Resource | Monthly Cost |
+| Resource | Monthly |
 |---|---|
-| e2-medium VM (8h/day, weekdays) | $8.09 |
-| 50GB pd-balanced disk (24/7) | $5.00 |
-| Cloud NAT (8h/day) | $1.20 |
+| e2-standard-2 VM (8 h/day weekdays) | $16.18 |
+| 50 GB pd-balanced disk (24/7) | $5.00 |
+| Cloud NAT (8 h/day) | $1.20 |
 | Egress estimate | $0.53 |
 
-Schedule: `openclaw-day-shift` — auto-start 9AM EST, auto-stop 5PM EST, daily.
-Override: `gcloud compute instances add-metadata openclaw-secure-node --zone=us-east4-a --metadata=overtime_active=true`
+The +$8/mo over the original v4 plan is the e2-medium → e2-standard-2 bump made for Phase 6 sidecar memory headroom. Phases 7–9 add no infrastructure cost (pure code on existing VM + disk).

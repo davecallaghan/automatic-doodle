@@ -949,14 +949,253 @@ sudo rm /mnt/disks/research/audit/genesis.json
 
 ---
 
-## ☑️ PHASE 9: FAIRNESS SCORECARD + MLflow TRACKING (planned)
+## ☑️ PHASE 9: FAIRNESS SCORECARD + MLflow TRACKING (15 minutes)
 
-**Status:** Designed, not yet implemented.
-**Plan ref:** `openclaw/EXECUTION_databricks_integration.md` Phase 3, plus the fairness threshold table in that doc.
+**Plan ref:** `openclaw/EXECUTION_databricks_integration.md` Phase 3 + fairness threshold table.
 
-What this phase does: computes a six-metric fairness scorecard for every brief (source-tier distribution, vendor diversity, counter-argument ratio, recency, paid-content disclosure, bias-checklist completeness), writes it to `gold.fairness_scorecards`, and routes briefs to `DRAFT` or `REJECTED` based on the threshold table. Logs every research run to MLflow with parameters, metrics, and artifacts. Writes a parallel row to `gold.run_summaries` so run details are queryable via SQL, not only via the MLflow UI.
+What this phase does: ships `openclaw/fairness_scorer.py` (six metrics, deterministic, pure Python) and `openclaw/mlflow_tracker.py` (thin facade over the MLflow client started in Phase 6). Wires both into `DatabricksWorker.record_validated_brief()` so calling it now produces the full bronze→silver→gold pipeline:
 
-Runbook will be added here when the phase is implemented.
+1. Silver writes (Phase 7) — `validated_briefs` + `citations`
+2. Fairness scorecard computed (Phase 9 — this phase)
+3. `gold.fairness_scorecards` written
+4. Status decided (`DRAFT` if all six thresholds pass, `REJECTED` otherwise — never `PROMOTED`; that's Phase 10)
+5. `gold.research_summaries` written with the status + failed_thresholds
+6. `gold.run_summaries` written when run_summary supplied
+7. MLflow run logged when tracker is wired
+8. Each write generates an integrity-chain entry (Phase 8)
+
+Threshold defaults (overridable via `FAIRNESS_*` env vars):
+| Metric | Default | Notes |
+|---|---|---|
+| `t1_t2_min_share` | 0.60 | T1+T2 citations as share of total |
+| `vendor_diversity_min` | 3 | Distinct vendor_orgs; bypassable with `single_vendor_justification` topic flag |
+| `counter_argument_min_ratio` | 0.15 | counter-arg words / total brief words |
+| `recency_min_share` | 0.50 | Citations within 18 months; bypassable with `historical_topic` topic flag |
+| `bias_check_complete` | all 5 answered | Free-text answers to the virtue prompt's checklist |
+| `paid_content_disclosed` | informational | Mirrors the bias-check question 4 answer |
+
+### Prerequisites
+- [ ] Phase 7 complete (worker installed; bronze/silver smoke test passes)
+- [ ] Phase 8 complete (chain wired; `audit` reports intact)
+- [ ] Phase 6 sidecars healthy (UC + MLflow responding)
+
+### Step 53: Pull Phase 9 files to the VM
+```bash
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/fairness_scorer.py \
+  openclaw/mlflow_tracker.py \
+  openclaw/requirements.txt \
+  openclaw-secure-node:~/openclaw/
+
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/tests/test_fairness_scorer.py \
+  openclaw/tests/test_mlflow_tracker.py \
+  openclaw-secure-node:~/openclaw/tests/
+```
+Phase 9 also modifies `databricks_worker.py` (adds `fairness_scorer` and `mlflow_tracker` constructor args, expands `record_validated_brief` to write gold tables). Push the updated worker too:
+```bash
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/databricks_worker.py \
+  openclaw-secure-node:~/openclaw/
+```
+
+### Step 54: Install MLflow client on the VM
+```bash
+oc-ssh
+pip install --user -r ~/openclaw/requirements.txt
+# Already installs deltalake/pydantic/pyarrow; mlflow is the new entry.
+
+python3 -c "import mlflow; print('mlflow', mlflow.__version__)"
+# Expected: mlflow 2.16.x (must match the server pinned in sidecars.sh)
+```
+
+### Step 55: Run unit tests on the VM
+```bash
+cd ~ && python3 -m pytest openclaw/tests/test_fairness_scorer.py openclaw/tests/test_mlflow_tracker.py -v
+```
+Expected: 35 passing (27 fairness + 8 MLflow tracker).
+
+### Step 56: Smoke-test the wired pipeline
+End-to-end: bronze → silver → fairness → gold → MLflow → chain. Run as a single Python invocation so the MLflow run lifecycle is correct:
+```bash
+oc-ssh
+export SECRET_SALT=$(grep '^SECRET_SALT=' /mnt/disks/research/.secrets/.env | cut -d= -f2)
+export MLFLOW_TRACKING_URI=http://localhost:5000
+
+python3 - <<'PY'
+import uuid
+from datetime import date, datetime, timezone
+
+from openclaw.databricks_worker import (
+    Citation, DatabricksWorker, ValidatedBrief, RawResponse, SourceFetch,
+)
+from openclaw.fairness_scorer import BiasChecklist, FairnessScorer, RunSummary
+from openclaw.mlflow_tracker import MLflowTracker
+
+now = datetime.now(timezone.utc)
+
+worker = DatabricksWorker(
+    fairness_scorer=FairnessScorer(),
+    mlflow_tracker=MLflowTracker(),
+)
+
+brief_id = str(uuid.uuid4())
+response_id = str(uuid.uuid4())
+
+# Bronze writes
+worker.record_raw_response(RawResponse(
+    response_id=response_id, created_at=now,
+    agent_version="openclaw-v4.0",
+    model_id="google/gemini-2.5-flash",
+    prompt_hash="0"*64, response_text="phase 9 smoke",
+    response_hash="1"*64, mlflow_run_id="placeholder",
+    topic_id="ai-safety",
+))
+
+# Silver + fairness + gold + MLflow
+brief = ValidatedBrief(
+    brief_id=brief_id, response_id=response_id, created_at=now,
+    topic_id="ai-safety", title="Phase 9 smoke test",
+    key_findings="x " * 200,
+    counter_arguments="counter " * 50,
+    practical_implications="x", further_reading="x",
+    content_hash="2"*64, agent_version="openclaw-v4.0",
+)
+citations = [
+    Citation(
+        citation_id=str(uuid.uuid4()), brief_id=brief_id,
+        url=f"https://example.com/{i}", title="src",
+        authority_tier=t, vendor_org=v,
+        publication_date=date.today(), is_paid_content=False,
+    )
+    for i, (t, v) in enumerate([(1, "Anthropic"), (1, "Google"), (2, "Databricks")])
+]
+bias = BiasChecklist(
+    only_confirming_sources="No, searched broadly.",
+    competing_perspectives_included="Yes, two competitors covered.",
+    limitations_acknowledged="Yes, dataset gaps noted.",
+    financial_incentive_disclosed="Yes, vendor blog flagged.",
+    publication_date_checked="Yes, all within 12 months.",
+)
+
+# Open a single MLflow run to wrap the writes
+with worker.mlflow_tracker.run(
+    topic="ai-safety",
+    model_id="google/gemini-2.5-flash",
+    prompt_version="virtue-prompt-v1",
+    agent_version="openclaw-v4.0",
+) as mlflow_run_id:
+    run_summary = RunSummary(
+        run_summary_id=str(uuid.uuid4()),
+        mlflow_run_id=mlflow_run_id,
+        brief_id=brief_id,
+        started_at=now, ended_at=now,
+        model_id="google/gemini-2.5-flash",
+        prompt_version="virtue-prompt-v1",
+        agent_version="openclaw-v4.0",
+        input_tokens=1500, output_tokens=600, total_cost_usd=0.002,
+        source_count=3, unique_domain_count=3,
+        latency_seconds=12.0, retry_count=0,
+    )
+    result = worker.record_validated_brief(
+        brief, citations, bias_check=bias, run_summary=run_summary,
+    )
+
+print(f"status:            {result['status']}")
+print(f"threshold_pass:    {result['scorecard'].threshold_pass}")
+print(f"failed_thresholds: {result['scorecard'].failed_thresholds}")
+print(f"mlflow_run_id:     {mlflow_run_id}")
+PY
+```
+Expected output:
+```
+status:            DRAFT
+threshold_pass:    True
+failed_thresholds: []
+mlflow_run_id:     <uuid>
+```
+
+### Step 57: Verify the writes round-trip
+```bash
+python3 ~/openclaw/databricks_worker.py read-recent --table gold.fairness_scorecards --limit 3
+python3 ~/openclaw/databricks_worker.py read-recent --table gold.research_summaries --limit 3
+python3 ~/openclaw/databricks_worker.py read-recent --table gold.run_summaries --limit 3
+
+# Chain entries for these writes also exist:
+python3 ~/openclaw/integrity_engine.py audit
+# Expected: ✓ Chain INTACT — count grew by ~6 entries (1 silver brief +
+#                            citations + 1 scorecard + 1 summary + 1 run_summary)
+```
+
+### Step 58: Verify in MLflow UI
+With your existing port-forward (`-L 5000:localhost:5000`) open, visit
+`http://localhost:5000`. You should see an `openclaw-research` experiment with the smoke-test run, including:
+
+- Params: `topic`, `model_id`, `prompt_version`, `agent_version`
+- Metrics: `source_tier_t1_pct`, `vendor_diversity_count`, `counter_argument_ratio`, `recency_within_18mo_pct`, `input_tokens`, `output_tokens`, `total_cost_usd`, `latency_seconds`
+- Tags: `threshold_pass=True`, `bias_check_complete=True`
+
+### Step 59: REJECTED-path drill
+Run the same script but with a brief that fails several thresholds, and confirm it lands as REJECTED with the right failure list:
+```bash
+python3 - <<'PY'
+import uuid
+from datetime import date, datetime, timezone
+from openclaw.databricks_worker import Citation, DatabricksWorker, ValidatedBrief
+from openclaw.fairness_scorer import FairnessScorer
+
+worker = DatabricksWorker(fairness_scorer=FairnessScorer(), mlflow_tracker=None)
+brief_id = str(uuid.uuid4())
+brief = ValidatedBrief(
+    brief_id=brief_id, response_id=str(uuid.uuid4()),
+    created_at=datetime.now(timezone.utc),
+    topic_id="db-tech", title="Failure drill",
+    key_findings="x " * 800,
+    counter_arguments="x"*100,  # technically passes the silver length check but ratio is tiny
+    practical_implications="x", further_reading="x",
+    content_hash="3"*64, agent_version="openclaw-v4.0",
+)
+# All T4 sources from one vendor with old dates
+citations = [
+    Citation(
+        citation_id=str(uuid.uuid4()), brief_id=brief_id,
+        url=f"https://blog.example/{i}", title="t",
+        authority_tier=4, vendor_org="OnlyVendor",
+        publication_date=date(2024, 1, 1),
+        is_paid_content=True, t4_justification="testing",
+    ) for i in range(3)
+]
+result = worker.record_validated_brief(brief, citations, bias_check=None)
+print(f"status:            {result['status']}")
+print(f"failed_thresholds: {result['scorecard'].failed_thresholds}")
+PY
+```
+Expected:
+```
+status:            REJECTED
+failed_thresholds: ['source_tier_t1_t2_share', 'vendor_diversity', 'counter_argument_ratio', 'recency', 'bias_check_complete']
+```
+
+The brief is still recorded — `gold.research_summaries` has it with `status=REJECTED` and `rejection_reasons` filled in. A human can override in Phase 10.
+
+### Phase 9 Sign-off
+- [ ] `pip install` adds mlflow without errors
+- [ ] All 35 fairness + MLflow tests pass on the VM
+- [ ] Smoke test completes; result reports `status=DRAFT, threshold_pass=True`
+- [ ] `read-recent --table gold.fairness_scorecards` returns the smoke row
+- [ ] `read-recent --table gold.research_summaries` shows the DRAFT entry
+- [ ] `read-recent --table gold.run_summaries` shows the operational metrics
+- [ ] MLflow UI shows the run with all six fairness metrics + token counts
+- [ ] Integrity chain audit still reports `INTACT` (Phase 8 invariant preserved)
+- [ ] REJECTED-path drill produces a multi-failure entry with correct `failed_thresholds`
+
+When all 9 are checked, Phase 9 is complete. Next branch: `databricks_promotion_cli` (Phase 10 — David promotes DRAFT briefs to `public_archive.published`).
+
+### Phase 9 cost impact
+**$0/mo.** Pure code on existing VM compute and persistent disk. MLflow's sqlite backend grows ~10 KB per run; even 50 runs/day is under 200 MB/year.
 
 ---
 

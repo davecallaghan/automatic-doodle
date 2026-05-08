@@ -276,6 +276,8 @@ class DatabricksWorker:
         delta_writer: DeltaTableWriter | None = None,
         local_buffer: LocalBuffer | None = None,
         chain_writer: Any = None,
+        fairness_scorer: Any = None,
+        mlflow_tracker: Any = None,
     ) -> None:
         self.delta = delta_writer or DeltaTableWriter()
         self.buffer = local_buffer or LocalBuffer()
@@ -284,6 +286,10 @@ class DatabricksWorker:
         if chain_writer is None:
             chain_writer = self._maybe_build_chain_writer()
         self.chain_writer = chain_writer if chain_writer else None
+        # Phase 9: optional fairness scoring and MLflow logging. Both default
+        # to None so Phase 7's record_validated_brief contract still works.
+        self.fairness_scorer = fairness_scorer
+        self.mlflow_tracker = mlflow_tracker
 
     @staticmethod
     def _maybe_build_chain_writer() -> Any:
@@ -307,11 +313,83 @@ class DatabricksWorker:
         self._write("bronze", "source_fetches", fetch.model_dump(), row_id=fetch.fetch_id)
 
     def record_validated_brief(
-        self, brief: ValidatedBrief, citations: list[Citation]
-    ) -> None:
+        self,
+        brief: ValidatedBrief,
+        citations: list[Citation],
+        bias_check: Any = None,
+        run_summary: Any = None,
+        topic_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Write a brief through the bronze->silver->gold pipeline.
+
+        Phase 7 behavior (no fairness_scorer wired): writes silver only.
+        Phase 9 behavior (fairness_scorer wired): also writes
+          gold.fairness_scorecards, gold.research_summaries (with DRAFT or
+          REJECTED status), and gold.run_summaries when run_summary is given.
+          MLflow metrics are logged when mlflow_tracker is wired and the
+          caller is inside an active run (managed by the caller).
+
+        Returns a dict with `scorecard`, `summary`, `status` keys when scoring
+        ran; an empty dict in Phase 7 mode.
+        """
+        # Silver writes (Phase 7 behavior — always)
         self._write("silver", "validated_briefs", brief.model_dump(), row_id=brief.brief_id)
         for c in citations:
             self._write("silver", "citations", c.model_dump(), row_id=c.citation_id)
+
+        if self.fairness_scorer is None:
+            return {}
+
+        # Gold writes (Phase 9)
+        from openclaw.fairness_scorer import (
+            ResearchSummary,
+            decide_status,
+        )
+
+        scorecard = self.fairness_scorer.score(
+            brief, citations, bias_check, topic_metadata
+        )
+        self._write(
+            "gold", "fairness_scorecards",
+            scorecard.model_dump(), row_id=scorecard.scorecard_id,
+        )
+
+        if run_summary is not None:
+            self._write(
+                "gold", "run_summaries",
+                run_summary.model_dump(), row_id=run_summary.run_summary_id,
+            )
+
+        status = decide_status(scorecard)
+        summary = ResearchSummary(
+            summary_id=str(uuid.uuid4()),
+            brief_id=brief.brief_id,
+            created_at=datetime.now(timezone.utc),
+            status=status,
+            rejection_reasons=(
+                scorecard.failed_thresholds if status == "REJECTED" else None
+            ),
+            mlflow_run_id=(
+                run_summary.mlflow_run_id if run_summary else "no-mlflow-run"
+            ),
+        )
+        self._write(
+            "gold", "research_summaries",
+            summary.model_dump(), row_id=summary.summary_id,
+        )
+
+        # Optionally log to MLflow (caller controls run lifecycle).
+        if self.mlflow_tracker is not None:
+            try:
+                self.mlflow_tracker.log_scorecard(scorecard)
+                if run_summary is not None:
+                    self.mlflow_tracker.log_run_summary(run_summary)
+            except Exception as e:
+                sys.stderr.write(
+                    f"WARN: MLflow logging failed (non-fatal): {e}\n"
+                )
+
+        return {"scorecard": scorecard, "summary": summary, "status": status}
 
     def drain_buffer(self) -> int:
         """Replay buffered writes against Delta. Returns count drained."""
