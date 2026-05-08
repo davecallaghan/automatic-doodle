@@ -20,8 +20,8 @@ The GitHub repo name ("automatic-doodle") was auto-assigned and kept — it fits
 | 6 | Databricks sidecars + Unity Catalog bootstrap | ✅ deployed |
 | 7 | Databricks worker (bronze + silver Delta writes) | 🟢 code on `databricks_worker` branch |
 | 8 | Integrity engine (linked-hash chain + Merkle seal) | 🟢 code on `databricks_integrity_engine` branch |
-| 9 | Fairness scorecard + MLflow tracking | 🟢 code on `databricks_fairness_scorecard` branch |
-| 10 | Promotion CLI + permission enforcement | 📋 planned |
+| 9 | Fairness scorecard + MLflow tracking | 🟢 code on main |
+| 10 | Promotion CLI (DRAFT → PROMOTED) | 🟢 code on main |
 | 11 | Adversarial validation suite | 📋 planned |
 | 12 | Public commons (Delta Sharing + GitHub) | 📋 planned |
 
@@ -91,20 +91,22 @@ automatic-doodle/
     ├── integrity_engine.py        ← Phase 8: chain + genesis + Merkle seal + audit CLI
     ├── fairness_scorer.py         ← Phase 9: deterministic 6-metric scoring
     ├── mlflow_tracker.py          ← Phase 9: MLflow client wrapper
+    ├── promote.py                 ← Phase 10: review + promote CLI (CC BY 4.0 markdown)
     ├── requirements.txt           ← Python deps (deltalake, pydantic, pyarrow, mlflow)
     ├── __init__.py
-    └── tests/                     ← pytest suite, 88 tests, all pure-Python
+    └── tests/                     ← pytest suite, 104 tests, all pure-Python
         ├── test_databricks_worker.py
         ├── test_integrity_engine.py
         ├── test_fairness_scorer.py
-        └── test_mlflow_tracker.py
+        ├── test_mlflow_tracker.py
+        └── test_promote.py
 ```
 
 ### Source of truth
 
 `init_agency.sh` is the source of truth for **shell scripts and small config files** (`sidecars.sh`, `unity_catalog_setup.sql`, `uc_init.py`). It writes them via heredocs. **If a bug exists in those generated files, fix it in `init_agency.sh` and regenerate — never patch the generated file directly.**
 
-For the larger Python application code (Phases 7–9 — `databricks_worker.py`, `integrity_engine.py`, `fairness_scorer.py`, `mlflow_tracker.py` and their tests), the heredoc pattern is brittle for ~300+ line files; those live as ordinary source files and are maintained directly.
+For the larger Python application code (Phases 7–10 — `databricks_worker.py`, `integrity_engine.py`, `fairness_scorer.py`, `mlflow_tracker.py`, `promote.py` and their tests), the heredoc pattern is brittle for ~300+ line files; those live as ordinary source files and are maintained directly.
 
 ---
 
@@ -138,6 +140,7 @@ For the larger Python application code (Phases 7–9 — `databricks_worker.py`,
 | Public network exposure | None — sidecars and gateway all bind 127.0.0.1 |
 | **Integrity chain (Phase 8)** | Every state-changing write produces an append-only chain entry whose row_signature = SHA-256(payload_hash ‖ prev_hash ‖ SECRET_SALT). Tamper detection is precise to the exact `sequence_id`. |
 | **Fairness gating (Phase 9)** | Briefs failing any of six thresholds land as `status='REJECTED'` with the failure list recorded. Agent cannot self-promote. |
+| **Promotion boundary (Phase 10)** | `status='PROMOTED'` is unreachable from agent code — only `promote.py` produces it. Each promotion writes 3 append-only rows (summary, published, log) and a chain entry tagged with the reviewer's `author_identity`. Override of a REJECTED brief requires an explicit `--override REASON`. |
 
 ---
 

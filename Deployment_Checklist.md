@@ -1199,14 +1199,135 @@ When all 9 are checked, Phase 9 is complete. Next branch: `databricks_promotion_
 
 ---
 
-## ☑️ PHASE 10: PROMOTION CLI + PERMISSION ENFORCEMENT (planned)
+## ☑️ PHASE 10: PROMOTION CLI (15 minutes)
 
-**Status:** Designed, not yet implemented.
 **Plan ref:** `openclaw/EXECUTION_databricks_integration.md` Phase 4.
 
-What this phase does: introduces `openclaw/promote.py` — a CLI that reviews DRAFT briefs and promotes approved ones into `public_archive.published`. Authenticates as the `david` UC principal (separate token, not in the agent container's env). Applies the full UC permission model: agent service principal has INSERT on bronze/silver/gold but no access to `public_archive`; `david` is the only principal that can promote. Promotion is an atomic UPDATE on `gold.research_summaries` plus INSERT on `public_archive.published`, written to `audit.promotion_log` with override reasons recorded.
+What this phase does: ships `openclaw/promote.py` — David's CLI for reviewing and promoting briefs. Phase 10 is the **only** code path that produces `status='PROMOTED'`; the agent has no way to reach this surface. Promotion writes three rows in append-only fashion (the integrity chain stays consistent and `delta-rs` UPDATE limitations are bypassed):
 
-Runbook will be added here when the phase is implemented.
+1. New `gold.research_summaries` row with `status=PROMOTED`
+2. New `public_archive.published` row with the rendered markdown + content_hash
+3. New `audit.promotion_log` row with prior/new status + override reason if any
+
+Each write fires the Phase 8 chain hook tagged with the reviewer's identity, so the integrity audit can distinguish `author_identity=openclaw-agent` from `author_identity=david` in the chain.
+
+**Phase 10 explicitly defers:**
+- **Physical principal separation.** Phase 10 v1 trusts the operator's `--reviewer` arg; the chain records it but doesn't enforce that promotions actually came from a separate UC token. A future phase introduces a separate `SECRET_SALT` / token for human reviewers, with mismatch detection.
+- **`UPDATE` semantics.** Append-only is the design choice (every status change is a new row, the latest by `created_at` wins). Cleaner with the integrity chain and avoids `delta-rs`'s Spark-only UPDATE.
+
+### Subcommands
+```
+promote list [--status DRAFT|REJECTED|PROMOTED] [--limit N]
+promote show <summary_id>
+promote approve <summary_id> [--reviewer NAME] [--override REASON] [--export PATH]
+promote reject  <summary_id> --reason TEXT [--reviewer NAME]
+promote history [--limit N]
+```
+
+### Prerequisites
+- [ ] Phase 9 complete (gold tables exist; DRAFT/REJECTED briefs visible)
+- [ ] `SECRET_SALT` exported (so promotions get chained per Phase 8)
+
+### Step 60: Pull Phase 10 files to the VM
+```bash
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/promote.py \
+  openclaw-secure-node:~/openclaw/
+
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/tests/test_promote.py \
+  openclaw-secure-node:~/openclaw/tests/
+```
+
+### Step 61: Run unit tests on the VM
+```bash
+oc-ssh
+cd ~ && python3 -m pytest openclaw/tests/test_promote.py -v
+```
+Expected: 16 passing.
+
+### Step 62: List DRAFT briefs awaiting review
+```bash
+export SECRET_SALT=$(grep '^SECRET_SALT=' /mnt/disks/research/.secrets/.env | cut -d= -f2)
+
+python3 ~/openclaw/promote.py list --status DRAFT
+# Expected: one or more rows from the Phase 9 smoke tests
+```
+Show one in detail:
+```bash
+python3 ~/openclaw/promote.py show <summary_id_from_list>
+```
+
+### Step 63: Approve a DRAFT and export the markdown
+```bash
+python3 ~/openclaw/promote.py approve <summary_id> \
+  --reviewer david \
+  --export /tmp/published-brief.md
+
+# Expected:
+#   ✓ promoted summary_id=<id>
+#     published_id:  pub-<12 hex>
+#     content_hash:  <64 hex>
+#     reviewer:      david
+#     markdown:      written to /tmp/published-brief.md
+
+# Sanity-check the content_hash
+python3 -c "import hashlib; print(hashlib.sha256(open('/tmp/published-brief.md','rb').read()).hexdigest())"
+# Should match the printed content_hash above.
+```
+
+### Step 64: Override-promote a REJECTED brief
+Use a REJECTED summary from the Phase 9 REJECTED-path drill:
+```bash
+python3 ~/openclaw/promote.py list --status REJECTED
+
+python3 ~/openclaw/promote.py approve <rejected_summary_id> \
+  --reviewer david \
+  --override "niche topic — single-vendor citations are appropriate here"
+```
+
+Without `--override`, the CLI refuses with `--override REASON is required`. With it, the promotion proceeds and the override reason is recorded in `audit.promotion_log` and embedded in the published markdown's frontmatter.
+
+### Step 65: Reject a DRAFT explicitly
+```bash
+python3 ~/openclaw/promote.py reject <summary_id> \
+  --reason "factual error in claim 3 — see source mismatch" \
+  --reviewer david
+```
+This appends a new `gold.research_summaries` row with `status=REJECTED` and the reviewer's reason. Future `list --status DRAFT` won't show it.
+
+### Step 66: Audit the promotion log
+```bash
+python3 ~/openclaw/promote.py history --limit 20
+# Expected: one line per promotion/rejection, newest first.
+
+python3 ~/openclaw/integrity_engine.py audit
+# Expected: ✓ Chain INTACT — promotion writes added 3 entries each
+```
+
+### Step 67: Verify the public_archive table
+```bash
+python3 ~/openclaw/databricks_worker.py read-recent --table public_archive.published --limit 5
+# Expected: row(s) with markdown_export field containing the rendered brief
+```
+
+### Phase 10 Sign-off
+- [ ] All 16 promote tests pass on the VM
+- [ ] `promote list --status DRAFT` returns the Phase 9 smoke briefs
+- [ ] `promote show <id>` displays brief + scorecard + history
+- [ ] `promote approve <id>` succeeds; markdown exported; content_hash matches `sha256` of file
+- [ ] Override-promotion of a REJECTED brief refused without `--override`, accepted with it
+- [ ] `promote reject <id> --reason ...` writes a new REJECTED row
+- [ ] `promote history` shows entries with correct prior/new status transitions
+- [ ] Integrity chain audit reports `INTACT` after promotions
+- [ ] `read-recent --table public_archive.published` returns the rendered brief
+
+When all 9 are checked, Phase 10 is complete. Next branch (or main, depending on cadence): Phase 11 (adversarial validation suite — exercising the boundary every prior phase asserts).
+
+### Phase 10 cost impact
+**$0/mo.** Pure code on existing VM compute and persistent disk.
 
 ---
 
