@@ -165,16 +165,41 @@ def test_validated_brief_counter_arg_min_length():
 # Worker chain hook (stub)
 # -----------------------------------------------------------------------------
 
-def test_chain_hook_logs_to_stderr(capsys, tmp_path):
-    """Phase 7's chain hook is a stub; verify it emits the expected log line.
-    Phase 8 replaces this with a real chain write — that test will live in
-    test_integrity_engine.py.
+def test_chain_hook_stub_logs_to_stderr(capsys, tmp_path):
+    """When no chain_writer is wired (Phase 7 / Phase 8 with no SECRET_SALT),
+    the hook logs to stderr instead of writing to the chain table. The
+    Phase 8 wired path is tested in test_integrity_engine.py.
     """
     from openclaw.databricks_worker import DatabricksWorker
-    w = DatabricksWorker()
+    # Force stub mode so the test doesn't accidentally pick up a real
+    # ChainWriter from a SECRET_SALT in the environment.
+    w = DatabricksWorker(chain_writer=False)
     w._chain_hook("INSERT", "research.bronze.raw_responses", "row-1", "abc123")
     captured = capsys.readouterr()
     assert "CHAIN_HOOK" in captured.err
     assert "operation=INSERT" in captured.err
     assert "row_id=row-1" in captured.err
     assert "payload_hash=abc123" in captured.err
+
+
+def test_chain_hook_calls_writer_when_wired(monkeypatch):
+    """When chain_writer is provided, the hook delegates to it instead of
+    logging to stderr.
+    """
+    from openclaw.databricks_worker import DatabricksWorker
+
+    calls: list[dict] = []
+
+    class FakeWriter:
+        def append_entry(self, **kwargs):
+            calls.append(kwargs)
+            return None
+
+    w = DatabricksWorker(chain_writer=FakeWriter())
+    w._chain_hook("INSERT", "research.bronze.raw_responses", "row-1", "abc123")
+
+    assert len(calls) == 1
+    assert calls[0]["operation"] == "INSERT"
+    assert calls[0]["target_table"] == "research.bronze.raw_responses"
+    assert calls[0]["target_row_id"] == "row-1"
+    assert calls[0]["target_payload_hash"] == "abc123"

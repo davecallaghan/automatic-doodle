@@ -735,16 +735,217 @@ pip uninstall -y deltalake pyarrow pydantic
 
 ---
 
-## ☑️ PHASE 8: INTEGRITY ENGINE — GENESIS + CHAIN + DAILY SEAL (planned)
+## ☑️ PHASE 8: INTEGRITY ENGINE — GENESIS + CHAIN + DAILY SEAL (20 minutes)
 
-**Status:** Designed, not yet implemented.
 **Plan ref:** `openclaw/EXECUTION_integrity_engine.md`.
 
-What this phase does: introduces `openclaw/integrity_engine.py` (linked-hash chain with SHA-256, daily Merkle seal at 4:55 PM EDT, salt-based signing) and `openclaw/integrity_cli.py` (`init`, `audit`, `seal` commands). Generates `SECRET_SALT`, writes the genesis block, hooks `ChainWriter` into every Phase 7 worker write so each operational table change produces a chain entry. Replaces the flat `audit.write_log` (never created) with `audit.integrity_chain`.
+What this phase does: ships `openclaw/integrity_engine.py` — a linked-hash chain (SHA-256, salted), genesis bootstrap, daily Merkle seal, and an audit utility that pinpoints the exact `sequence_id` of any tamper. When `SECRET_SALT` is present in the agent's environment, Phase 7's `DatabricksWorker._chain_hook` automatically delegates to the real `ChainWriter` instead of logging a stub line — every bronze and silver write now produces an append-only chain entry whose `row_signature` includes the prior entry's signature.
 
-This phase **must precede or accompany** any code path that writes to the operational tables. In practice, Phase 7 and Phase 8 can be built in either order, but neither should be deployed without the other.
+### Prerequisites
+- [ ] Phase 7 complete on the VM (`databricks_worker.py` installed, smoke-tested)
+- [ ] You have ~5 minutes of focus to generate and store `SECRET_SALT` carefully — it cannot be rotated in v1, and losing it makes existing chain entries unverifiable
 
-Runbook will be added here when the phase is implemented. Will include `SECRET_SALT` generation, genesis bootstrap, chain audit verification.
+### Step 44: Pull Phase 8 files to the VM
+```bash
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/integrity_engine.py \
+  openclaw-secure-node:~/openclaw/
+
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/tests/test_integrity_engine.py \
+  openclaw-secure-node:~/openclaw/tests/
+```
+
+### Step 45: Generate and store `SECRET_SALT`
+```bash
+oc-ssh
+
+# Generate a 64-char hex salt (32 bytes of entropy)
+NEW_SALT=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+
+# Append to the secrets .env (read-only mounted into openclaw container)
+sudo bash -c "grep -q '^SECRET_SALT=' /mnt/disks/research/.secrets/.env && \
+  sed -i 's|^SECRET_SALT=.*|SECRET_SALT=$NEW_SALT|' /mnt/disks/research/.secrets/.env || \
+  echo 'SECRET_SALT=$NEW_SALT' >> /mnt/disks/research/.secrets/.env"
+
+# Confirm it's there:
+sudo grep '^SECRET_SALT=' /mnt/disks/research/.secrets/.env
+```
+
+**Critical:** Back up this salt to your password manager NOW. Losing it means
+historical chain entries can't be verified individually (though external seal
+verification via Phase 12's public seal log will still work).
+
+### Step 46: Run unit tests on the VM
+```bash
+cd ~ && python3 -m pytest openclaw/tests/test_integrity_engine.py -v
+```
+Expected: 22 passing.
+
+### Step 47: Bootstrap the chain — write the genesis block
+```bash
+# Export salt for the CLI invocation (env var in this shell only).
+export SECRET_SALT=$(sudo grep '^SECRET_SALT=' /mnt/disks/research/.secrets/.env | cut -d= -f2)
+
+# Make sure the genesis-anchor directory is writable
+sudo mkdir -p /mnt/disks/research/audit
+sudo chown -R "$(id -u):$(id -g)" /mnt/disks/research/audit
+
+python3 ~/openclaw/integrity_engine.py init \
+  --project openclaw-public-commons \
+  --agent-version openclaw-v4.0
+```
+Expected output:
+```
+✓ genesis written
+  sequence_id:         0
+  target_payload_hash: <64 hex>
+  row_signature:       <64 hex>
+  anchor written to:   /mnt/disks/research/audit/genesis.json
+```
+
+### Step 48: Verify the chain is intact
+```bash
+python3 ~/openclaw/integrity_engine.py audit
+# Expected: ✓ Chain INTACT: 1 entries verified up to sequence_id=0
+
+python3 ~/openclaw/integrity_engine.py status
+# Expected: chain length: 1 / first sequence: 0 / last sequence: 0 / genesis row: ...
+```
+
+### Step 49: Smoke-test wired chain hook (Phase 7 + Phase 8)
+With `SECRET_SALT` exported, the worker now writes real chain entries on every Delta write:
+```bash
+cat <<'EOF' | python3 ~/openclaw/databricks_worker.py record-response
+{
+  "response_id": "phase8-smoke-001",
+  "created_at": "2026-05-07T22:55:00Z",
+  "agent_version": "openclaw-v4.0",
+  "model_id": "google/gemini-2.5-flash",
+  "prompt_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "response_text": "Phase 8 wired-chain smoke test.",
+  "response_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+  "mlflow_run_id": "phase8-run-001",
+  "topic_id": "ai-safety"
+}
+EOF
+# Note: NO "CHAIN_HOOK ..." line on stderr now — the hook wrote a real entry instead.
+
+python3 ~/openclaw/integrity_engine.py status
+# Expected: chain length: 2 (genesis + the new INSERT)
+
+python3 ~/openclaw/integrity_engine.py audit
+# Expected: ✓ Chain INTACT: 2 entries verified up to sequence_id=1
+
+python3 ~/openclaw/databricks_worker.py read-recent --table audit.integrity_chain --limit 5
+# Expected: JSON with the genesis row (sequence_id=0, operation=GENESIS) and
+# the INSERT row (sequence_id=1, operation=INSERT, target_table=research.bronze.raw_responses)
+```
+
+### Step 50: Tamper-detection drill
+A sanity check that the auditor actually catches what it's supposed to.
+```bash
+# Read out an existing INSERT entry's sequence_id and write a deliberately
+# bad row directly to the chain (bypassing the worker), then audit:
+python3 - <<'PY'
+import os
+from datetime import datetime, timezone
+from openclaw.integrity_engine import (
+    Salter, Signer, ChainStore, ChainEntry, ChainOperation,
+)
+from openclaw.databricks_worker import DeltaTableWriter
+
+salter = Salter()
+signer = Signer(salter)
+store = ChainStore(DeltaTableWriter())
+latest = store.read_latest()
+print(f"current chain length: {latest.sequence_id + 1}")
+
+# Forge an entry with a valid signature relative to the WRONG previous_hash
+# (i.e., it claims the chain history is something it isn't).
+bad = ChainEntry(
+    sequence_id=latest.sequence_id + 1,
+    recorded_at=datetime.now(timezone.utc),
+    author_identity="adversarial-test",
+    operation=ChainOperation.INSERT,
+    target_table="research.bronze.raw_responses",
+    target_row_id="forged-001",
+    target_payload_hash="f"*64,
+    previous_hash="0"*64,  # WRONG — should be latest.row_signature
+    row_signature=signer.sign("f"*64, "0"*64, salter.current_version),
+    salt_version=salter.current_version,
+)
+store.append(bad)
+print(f"forged entry appended at sequence_id={bad.sequence_id}")
+PY
+
+python3 ~/openclaw/integrity_engine.py audit
+# Expected: ✗ TAMPER DETECTED at sequence_id=<the forged seq>
+#           Reason: previous_hash does not match prior row's row_signature
+```
+
+**If this prints `Chain INTACT`, something is wrong with the auditor — investigate before proceeding.**
+
+Clean up the forged entry by restoring from the snapshot taken in Step 36, or by deleting the `audit/integrity_chain/` Delta table and re-running `init`. (For Phase 8 v1, there's no built-in chain truncation — re-init is the recovery path during testing.)
+
+### Step 51: Daily seal smoke test
+```bash
+python3 ~/openclaw/integrity_engine.py seal
+# If today's chain has at least one INSERT/UPDATE/DELETE row:
+#   ✓ daily seal written
+#   sequence_id: <N+1>, target_payload_hash: <hex>, row_signature: <hex>
+# If today has only the GENESIS or no rows:
+#   no chain entries on YYYY-MM-DD; nothing to seal
+
+python3 ~/openclaw/integrity_engine.py audit
+# Expected: ✓ Chain INTACT (the new CHECKPOINT row verifies cleanly)
+
+# Idempotency check — running seal again is a no-op.
+python3 ~/openclaw/integrity_engine.py seal
+# Expected: same output as first run; chain length unchanged
+```
+
+### Step 52: Wire the seal into the daily schedule (4:55 PM EDT)
+The architectural decision (per `EXECUTION_integrity_engine.md`) is to fire the seal as the agent's last action before VM auto-stop at 5 PM EDT. For Phase 8 v1 deployment, schedule a host-cron entry:
+```bash
+oc-ssh
+crontab -e
+# Add this line (4:55 PM EDT = 20:55 UTC during DST, 21:55 UTC during EST):
+55 20 * * 1-5 SECRET_SALT=$(grep '^SECRET_SALT=' /mnt/disks/research/.secrets/.env | cut -d= -f2) /usr/bin/python3 /home/$(whoami)/openclaw/integrity_engine.py seal >> /mnt/disks/research/logs/seal.log 2>&1
+```
+Verify after 4:55 PM by checking `/mnt/disks/research/logs/seal.log` and re-running `audit`.
+
+### Phase 8 Sign-off
+- [ ] `SECRET_SALT` generated, stored in `.env`, **backed up to password manager**
+- [ ] All 22 integrity-engine unit tests pass on the VM
+- [ ] `init` succeeds; genesis row visible at `sequence_id=0`
+- [ ] `audit` reports `Chain INTACT`
+- [ ] `databricks_worker.py record-response` no longer prints `CHAIN_HOOK ...` on stderr (hook is real now)
+- [ ] Worker writes show up as INSERT entries in the chain (`read-recent --table audit.integrity_chain`)
+- [ ] Tamper-detection drill succeeds (forged entry → audit flags exact sequence_id)
+- [ ] Daily seal smoke test succeeds + idempotent on second invocation
+- [ ] Cron entry added for 4:55 PM EDT daily seal
+- [ ] `genesis.json` anchor file present at `/mnt/disks/research/audit/genesis.json` (also worth backing up alongside the salt)
+- [ ] OpenClaw container still healthy
+
+When all 11 are checked, Phase 8 is complete. Next branch: `databricks_fairness_scorecard` (Phase 9 — fairness metrics + MLflow run logging).
+
+### Phase 8 rollback
+**Important:** rolling back Phase 8 invalidates any chain entries already written.
+```bash
+# Option A: leave SECRET_SALT in env, just disable the worker's chain wiring
+unset SECRET_SALT  # for current shell only — agent reads from .env on each run
+
+# Option B: full reset (loses chain history)
+sudo rm -rf /mnt/disks/research/delta/research/audit/integrity_chain
+sudo rm /mnt/disks/research/audit/genesis.json
+# Then re-run init when ready to restart.
+```
+
+### Phase 8 cost impact
+**$0/mo.** Pure code on existing VM compute and persistent disk. Chain entries are tiny (a few KB per row); even 10K writes/day is under 50 MB/year of additional disk usage.
 
 ---
 

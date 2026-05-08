@@ -275,9 +275,30 @@ class DatabricksWorker:
         self,
         delta_writer: DeltaTableWriter | None = None,
         local_buffer: LocalBuffer | None = None,
+        chain_writer: Any = None,
     ) -> None:
         self.delta = delta_writer or DeltaTableWriter()
         self.buffer = local_buffer or LocalBuffer()
+        # Phase 8: when SECRET_SALT is in env, auto-wire a real ChainWriter.
+        # Pass chain_writer=False explicitly to force stub mode (used by tests).
+        if chain_writer is None:
+            chain_writer = self._maybe_build_chain_writer()
+        self.chain_writer = chain_writer if chain_writer else None
+
+    @staticmethod
+    def _maybe_build_chain_writer() -> Any:
+        if not os.environ.get("SECRET_SALT"):
+            return None
+        try:
+            from openclaw.integrity_engine import build_components
+            _store, writer, _signer, _salter, _anchor = build_components()
+            return writer
+        except Exception as e:
+            sys.stderr.write(
+                f"WARN: SECRET_SALT is set but integrity engine could not be "
+                f"initialized ({e}); falling back to chain stub\n"
+            )
+            return None
 
     def record_raw_response(self, resp: RawResponse) -> None:
         self._write("bronze", "raw_responses", resp.model_dump(), row_id=resp.response_id)
@@ -334,10 +355,20 @@ class DatabricksWorker:
     def _chain_hook(
         self, operation: str, table: str, row_id: str, payload_hash: str
     ) -> None:
-        """Phase 7 STUB. Phase 8 will replace this with a real append to
-        research.audit.integrity_chain. For now, log the intent so deployment
-        validation can confirm the right hook firings happened.
+        """Phase 8: if a ChainWriter is wired, append a real entry to
+        research.audit.integrity_chain. Otherwise (no SECRET_SALT, or
+        chain_writer=False for tests), log the intent so the operator can
+        still see what would have been recorded.
         """
+        if self.chain_writer is not None:
+            self.chain_writer.append_entry(
+                operation=operation,
+                target_table=table,
+                target_row_id=row_id,
+                target_payload_hash=payload_hash,
+                author_identity=os.environ.get("AGENT_IDENTITY", "openclaw-agent"),
+            )
+            return
         sys.stderr.write(
             f"CHAIN_HOOK operation={operation} table={table} "
             f"row_id={row_id} payload_hash={payload_hash}\n"
