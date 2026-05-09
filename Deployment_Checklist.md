@@ -1331,14 +1331,147 @@ When all 9 are checked, Phase 10 is complete. Next branch (or main, depending on
 
 ---
 
-## ☑️ PHASE 11: ADVERSARIAL VALIDATION SUITE (planned)
+## ☑️ PHASE 11: ADVERSARIAL VALIDATION SUITE (15 minutes)
 
-**Status:** Designed, not yet implemented.
-**Plan refs:** `openclaw/EXECUTION_databricks_integration.md` Phase 5 (operational invariants); `openclaw/EXECUTION_integrity_engine.md` (chain-tamper invariants).
+**Plan refs:** `openclaw/EXECUTION_databricks_integration.md` Phase 5; `openclaw/EXECUTION_integrity_engine.md` (chain invariants).
 
-What this phase does: introduces `openclaw/tests/test_adversarial.py` — a pytest suite that confirms each enforcement boundary holds under attack, not just under happy-path use. Tests include rejected briefs with empty counter-arguments, agent attempts to UPDATE `gold.research_summaries`, agent attempts to INSERT into `public_archive`, prompt-injection promotion attempts via Telegram, source-page tampering detection, content-hash mismatch detection, time-travel verification, and the full chain-tamper test list (content edit, row deletion, sequence reorder, daily seal forgery, genesis tamper, salt unavailable, replay).
+What this phase does: ships **two complementary verification surfaces** for the boundaries asserted across Phases 7-10:
 
-Runbook will be added here when the phase is implemented.
+1. `openclaw/tests/test_adversarial.py` — 20 pytest tests covering cross-cutting attack scenarios that the per-module tests don't reach (code-boundary statics, end-to-end attack flows, replay attacks, content-hash tamper detection, forged chain-entry detection).
+
+2. `openclaw/adversarial_drills.py` — operator CLI that runs the same boundary checks against the **live** Delta data on the VM. Each drill prints PASS/FAIL with details:
+    - `boundary-check` — static analysis: no agent module imports promote.py; only promote.py constructs `status='PROMOTED'`
+    - `promotion-blocked` — DatabricksWorker has no method matching `promote`/`publish`/`approve`
+    - `pydantic-invariants` — short counter_arguments and unjustified T4 citations are rejected at construction time
+    - `chain-audit` — runs the integrity audit; passes only if INTACT
+    - `markdown-integrity <published_id>` — recomputes SHA-256 of stored markdown_export, compares to content_hash
+    - `all` — runs every drill except markdown-integrity, prints summary
+
+**Phase 11 deliberately does NOT introduce new features.** It's the verification layer. Every prior phase asserted invariants; Phase 11 confirms they hold.
+
+Phase 11 also hot-fixes a latent issue from earlier phases: `python3 ~/openclaw/<script>.py` invocations from `~` could not import sibling modules under the `openclaw` package because `sys.path[0]` was set to `openclaw/` rather than its parent. Each affected CLI (`integrity_engine.py`, `promote.py`, `adversarial_drills.py`) now bootstraps its parent directory onto `sys.path` so direct script invocation works regardless of cwd.
+
+### Prerequisites
+- [ ] Phase 10 complete (promotion CLI installed; at least one PROMOTED entry in `public_archive.published`)
+- [ ] `SECRET_SALT` exported (so `chain-audit` can run)
+
+### Step 68: Pull Phase 11 files to the VM
+```bash
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/adversarial_drills.py \
+  openclaw/integrity_engine.py \
+  openclaw/promote.py \
+  openclaw-secure-node:~/openclaw/
+
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/tests/test_adversarial.py \
+  openclaw-secure-node:~/openclaw/tests/
+```
+The `integrity_engine.py` and `promote.py` are re-pushed because they got the path-bootstrap fix.
+
+### Step 69: Run the full pytest suite on the VM
+```bash
+oc-ssh
+cd ~ && python3 -m pytest openclaw/tests/ -v
+```
+Expected: **124 passing** (across all phases).
+
+Spot-check the Phase 11 portion specifically:
+```bash
+python3 -m pytest openclaw/tests/test_adversarial.py -v --no-header
+```
+Expected: 20 passing (boundary statics, exhaustion, end-to-end, post-promotion tamper detection, source integrity, chain integration, salt/signing, forged chain detection, Pydantic invariants).
+
+### Step 70: Run the live drills
+```bash
+export SECRET_SALT=$(grep '^SECRET_SALT=' /mnt/disks/research/.secrets/.env | cut -d= -f2)
+
+python3 ~/openclaw/adversarial_drills.py all
+```
+Expected output ends with:
+```
+=== summary ===
+passed: 4/4
+failed: 0/4
+```
+
+If `chain-audit` fails: investigate immediately — that means the integrity chain is reporting tamper on the live system, not just in tests. Run `python3 ~/openclaw/integrity_engine.py audit` for the precise sequence_id and reason.
+
+### Step 71: Drill — markdown integrity for a real published brief
+Pick a published_id from the Phase 10 promotion(s):
+```bash
+python3 ~/openclaw/databricks_worker.py read-recent --table public_archive.published --limit 1 \
+  | python3 -c "import sys, json; print(json.load(sys.stdin)[0]['published_id'])"
+# → e.g. pub-3a7c1b9e4f02
+
+python3 ~/openclaw/adversarial_drills.py markdown-integrity pub-3a7c1b9e4f02
+# Expected:
+#   ✓ content_hash matches recompute (a3f2c1...)
+```
+
+### Step 72: Drill — simulated tamper detection (destructive; do on snapshot or skip in prod)
+This drill **modifies a real Delta row** to confirm the auditor catches it. **Take a snapshot before running** so you can roll back:
+```bash
+oc-snapshot
+SNAPSHOT_NAME="openclaw-pre-phase11-tamper-$(date +%Y%m%d-%H%M)"
+echo "Pre-tamper snapshot: $SNAPSHOT_NAME"
+
+# Tamper: directly modify one chain entry's target_payload_hash via a delta-rs write.
+python3 - <<'PY'
+import os
+from datetime import datetime, timezone
+from openclaw.integrity_engine import (
+    Salter, Signer, ChainStore, ChainEntry, ChainOperation,
+)
+from openclaw.databricks_worker import DeltaTableWriter
+
+salter = Salter()
+signer = Signer(salter)
+store = ChainStore(DeltaTableWriter())
+latest = store.read_latest()
+print(f"appending forged entry at sequence_id={latest.sequence_id + 1}")
+
+bad = ChainEntry(
+    sequence_id=latest.sequence_id + 1,
+    recorded_at=datetime.now(timezone.utc),
+    author_identity="adversarial-drill",
+    operation=ChainOperation.INSERT,
+    target_table="research.bronze.raw_responses",
+    target_row_id="forged-drill-001",
+    target_payload_hash="f"*64,
+    previous_hash="0"*64,  # WRONG — should be latest.row_signature
+    row_signature=signer.sign("f"*64, "0"*64, salter.current_version),
+    salt_version=salter.current_version,
+)
+store.append(bad)
+PY
+
+# Audit MUST detect:
+python3 ~/openclaw/integrity_engine.py audit
+# Expected: ✗ TAMPER DETECTED at sequence_id=<the forged seq>
+#           Reason: previous_hash does not match prior row's row_signature
+
+# Rollback to clean state by restoring the snapshot taken at the start of this step:
+# (See "Rollback to Previous Snapshot" in MANUAL_COMMANDS.md.)
+```
+**This is the operational equivalent of the pytest test `test_forged_chain_entry_with_wrong_prev_hash_detected`.** It confirms the same invariant against the live datastore.
+
+If you'd rather not modify the live chain, run only Steps 68-71. The pytest suite covers the same scenarios in isolation.
+
+### Phase 11 Sign-off
+- [ ] All 124 tests pass on the VM (`pytest openclaw/tests/`)
+- [ ] All 20 Phase 11 adversarial tests pass specifically
+- [ ] `adversarial_drills.py all` reports passed: 4/4
+- [ ] `markdown-integrity <real_published_id>` confirms hash matches
+- [ ] (optional) Live tamper drill detected at correct sequence_id, then chain restored from snapshot
+- [ ] `python3 ~/openclaw/integrity_engine.py audit` reports `Chain INTACT` after any drill cleanup
+
+When all six are checked, Phase 11 is complete. Next: Phase 12 (public commons via Delta Sharing + GitHub durable archive + daily Merkle seal publication).
+
+### Phase 11 cost impact
+**$0/mo.** Tests and drills run on existing VM compute.
 
 ---
 

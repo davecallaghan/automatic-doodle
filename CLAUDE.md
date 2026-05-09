@@ -22,7 +22,7 @@ The GitHub repo name ("automatic-doodle") was auto-assigned and kept — it fits
 | 8 | Integrity engine (linked-hash chain + Merkle seal) | 🟢 code on `databricks_integrity_engine` branch |
 | 9 | Fairness scorecard + MLflow tracking | 🟢 code on main |
 | 10 | Promotion CLI (DRAFT → PROMOTED) | 🟢 code on main |
-| 11 | Adversarial validation suite | 📋 planned |
+| 11 | Adversarial validation suite | 🟢 code on main |
 | 12 | Public commons (Delta Sharing + GitHub) | 📋 planned |
 
 The single source of truth for deployment is [Deployment_Checklist.md](Deployment_Checklist.md) — top-to-bottom runbook covering every component in deployment order.
@@ -92,14 +92,16 @@ automatic-doodle/
     ├── fairness_scorer.py         ← Phase 9: deterministic 6-metric scoring
     ├── mlflow_tracker.py          ← Phase 9: MLflow client wrapper
     ├── promote.py                 ← Phase 10: review + promote CLI (CC BY 4.0 markdown)
+    ├── adversarial_drills.py      ← Phase 11: live-system boundary verification CLI
     ├── requirements.txt           ← Python deps (deltalake, pydantic, pyarrow, mlflow)
     ├── __init__.py
-    └── tests/                     ← pytest suite, 104 tests, all pure-Python
+    └── tests/                     ← pytest suite, 124 tests, all pure-Python
         ├── test_databricks_worker.py
         ├── test_integrity_engine.py
         ├── test_fairness_scorer.py
         ├── test_mlflow_tracker.py
-        └── test_promote.py
+        ├── test_promote.py
+        └── test_adversarial.py    ← Phase 11: cross-cutting attack scenarios
 ```
 
 ### Source of truth

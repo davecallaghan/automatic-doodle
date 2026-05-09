@@ -32,6 +32,10 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+# Allow `python3 ~/openclaw/integrity_engine.py ...` to import sibling
+# modules under the openclaw package regardless of cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from pydantic import BaseModel, Field, field_validator
 
 from openclaw.databricks_worker import (

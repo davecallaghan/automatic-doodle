@@ -38,6 +38,10 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Allow `python3 ~/openclaw/promote.py ...` to import sibling modules
+# under the openclaw package regardless of cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from pydantic import BaseModel, Field
 
 from openclaw.databricks_worker import (
