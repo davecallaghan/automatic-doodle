@@ -167,17 +167,69 @@ For the larger Python application code (Phases 7–10 — `databricks_worker.py`
 
 ---
 
-## Research Configuration
+## Agent Behavior & Virtue Protocol
 
-**Topics** (`openclaw/workspace/topics.json`): AI Safety & Alignment (high), Databricks & Unity Catalog (medium), Small Language Models (medium), Developer Tooling (low).
+The OpenClaw agent's behavior is governed by two binding documents:
 
-**Virtue Protocol** (`openclaw/workspace/virtue_prompt.md`):
-1. Devil's Advocate: counter-arguments mandatory
-2. Authority Ranking: tier 1 (docs/papers) → tier 4 (SEO spam)
-3. Regenerative Export: CC BY 4.0 publishing to `/public_archive`
-4. Bias Awareness: 5-question checklist
+| Document | Role |
+|---|---|
+| [AGENT_CONTRACT.md](AGENT_CONTRACT.md) | Mission, non-goals, safety/harm constraints, environment & tool boundaries. Authoritative on what the agent will and won't do. |
+| [openclaw/workspace/virtue_prompt.md](openclaw/workspace/virtue_prompt.md) | Skills definition — counter-arguments, authority tiers, bias checklist, regenerative export, hyper-honest blog post template. The system-prompt content. |
 
-Phase 9 turns each of these from advisory text into measurable, queryable properties — `gold.fairness_scorecards` records the score per brief; `gold.research_summaries.status` blocks promotion if any threshold fails.
+**Resolution order on conflict:** Safety constraints (contract §2) → Virtue Protocol skills → stylistic preferences. If a system-prompt change conflicts with `virtue_prompt.md`, the conflict must be resolved explicitly in code or documentation before deployment.
+
+### What every research brief MUST do
+
+- Include a **Counter-Argument** / Alternative Perspective section.
+- Tag every citation with an **authority tier** (1 = primary docs/papers, 4 = SEO spam). T4 sources require an inline `t4_justification`.
+- Pass the **Bias Awareness Checklist** (five free-text answers) before finalization.
+- Meet the **Output Quality Standards** (300–500 words, ≥3 mixed-tier citations, four required sections, metadata).
+- Follow the **Regenerative Contribution** rules — CC BY 4.0, beginner-accessible, gap-filling, cross-referenced.
+
+### Harmful Behavior Constraints
+
+In addition to the epistemic virtues, the agent obeys the **Safety Boundaries (Harmful Behavior)** section of `virtue_prompt.md`, which restates the hard red lines from AGENT_CONTRACT.md §2.1: no exploit instructions, no harm guidance, no doxxing, no targeted persuasion, no paywall circumvention.
+
+### Regenerative Contribution Skills
+
+The agent is expected to:
+
+- Produce **new synthesized artifacts** (comparison tables, decision trees, checklists) where the ecosystem lacks them.
+- **Update and annotate outdated information** in exported briefs, marking what changed.
+- Maintain a **cross-linked public archive** under CC BY 4.0.
+- Suggest **verification paths** so a reader can reproduce or extend the research.
+
+### Hyper-Honest Blog Use Case
+
+The primary deliverable is **blog-ready drafts** following the *Hyper-Honest Blog Post Template* in `virtue_prompt.md`. Each draft includes, in order:
+
+1. Epistemic Status (high / medium / low / speculative — labeled inline)
+2. Key Claims (each with a cited source + tier)
+3. Counter-Arguments / Alternative Perspectives
+4. Practical Implications, differentiated by user profile
+5. Further Reading (Tier 1–2 prioritized)
+6. **What Would Change My Mind?** — the specific evidence that would invalidate the post
+
+Drafts are suitable for publication under CC BY 4.0 in `public_archive.published`. Phase 12's `commons_publisher.py export-briefs` exports each PROMOTED draft as a standalone markdown file.
+
+### Research Topics
+
+`openclaw/workspace/topics.json`: AI Safety & Alignment (high), Databricks & Unity Catalog (medium), Small Language Models (medium), Developer Tooling (low).
+
+### How the Virtue Protocol is enforced (not just declared)
+
+| Virtue | Enforcement layer |
+|---|---|
+| Counter-Arguments mandatory | `silver.validated_briefs` Pydantic + CHECK constraint (`length(counter_arguments) >= 100`) |
+| Authority tier on every citation | `silver.citations.authority_tier` enum + `t4_justification` required for T4 |
+| Bias Awareness Checklist complete | `gold.fairness_scorecards.bias_check_complete` |
+| T1+T2 share ≥ 60%, vendor diversity ≥ 3, counter-arg ratio ≥ 15%, recency 18mo ≥ 50% | Phase 9 fairness thresholds → status DRAFT vs REJECTED |
+| Promotion gate | Phase 10 `promote.py` is the only code path that produces `status='PROMOTED'`; agent has no API path |
+| Hyper-Honest Blog Post Template | Phase 10 `MarkdownExporter` renders to public_archive |
+| Regenerative Export to commons | Phase 12 `commons_publisher.py` (briefs + ledger + seal log) |
+| Tamper-evident audit | Phase 8 integrity chain — every brief, scorecard, summary, promotion produces a chain entry |
+
+Phase 9 turns the virtue prompt's advisory text into measurable, queryable properties. A brief that fails any threshold lands as `REJECTED` with the failure list recorded; promotion requires an explicit human override with a documented reason.
 
 ---
 
