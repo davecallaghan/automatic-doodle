@@ -23,7 +23,9 @@ The GitHub repo name ("automatic-doodle") was auto-assigned and kept — it fits
 | 9 | Fairness scorecard + MLflow tracking | 🟢 code on main |
 | 10 | Promotion CLI (DRAFT → PROMOTED) | 🟢 code on main |
 | 11 | Adversarial validation suite | 🟢 code on main |
-| 12 | Public commons (Delta Sharing + GitHub) | 📋 planned |
+| 12 | Public commons (local export + seal log) | 🟢 code on main |
+| 12.5 | Delta Sharing server sidecar | 📋 follow-up |
+| 12.6 | Public distribution (GitHub / API / MCP / etc.) | 📋 follow-up |
 
 The single source of truth for deployment is [Deployment_Checklist.md](Deployment_Checklist.md) — top-to-bottom runbook covering every component in deployment order.
 
@@ -93,15 +95,17 @@ automatic-doodle/
     ├── mlflow_tracker.py          ← Phase 9: MLflow client wrapper
     ├── promote.py                 ← Phase 10: review + promote CLI (CC BY 4.0 markdown)
     ├── adversarial_drills.py      ← Phase 11: live-system boundary verification CLI
+    ├── commons_publisher.py       ← Phase 12: ledger rollup, brief export, seal log
     ├── requirements.txt           ← Python deps (deltalake, pydantic, pyarrow, mlflow)
     ├── __init__.py
-    └── tests/                     ← pytest suite, 124 tests, all pure-Python
+    └── tests/                     ← pytest suite, 147 tests, all pure-Python
         ├── test_databricks_worker.py
         ├── test_integrity_engine.py
         ├── test_fairness_scorer.py
         ├── test_mlflow_tracker.py
         ├── test_promote.py
-        └── test_adversarial.py    ← Phase 11: cross-cutting attack scenarios
+        ├── test_adversarial.py    ← Phase 11: cross-cutting attack scenarios
+        └── test_commons_publisher.py
 ```
 
 ### Source of truth
@@ -143,6 +147,7 @@ For the larger Python application code (Phases 7–10 — `databricks_worker.py`
 | **Integrity chain (Phase 8)** | Every state-changing write produces an append-only chain entry whose row_signature = SHA-256(payload_hash ‖ prev_hash ‖ SECRET_SALT). Tamper detection is precise to the exact `sequence_id`. |
 | **Fairness gating (Phase 9)** | Briefs failing any of six thresholds land as `status='REJECTED'` with the failure list recorded. Agent cannot self-promote. |
 | **Promotion boundary (Phase 10)** | `status='PROMOTED'` is unreachable from agent code — only `promote.py` produces it. Each promotion writes 3 append-only rows (summary, published, log) and a chain entry tagged with the reviewer's `author_identity`. Override of a REJECTED brief requires an explicit `--override REASON`. |
+| **Public commons (Phase 12)** | A nightly export produces durable markdown copies of every PROMOTED brief, a daily AI-usage rollup with `give_back_ratio`, and a `SEALS.md` log of daily Merkle seals. External observers can verify chain integrity from `SEALS.md` without holding `SECRET_SALT`. Distribution channel is deferred. |
 
 ---
 

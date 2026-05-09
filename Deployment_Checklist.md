@@ -1475,16 +1475,159 @@ When all six are checked, Phase 11 is complete. Next: Phase 12 (public commons v
 
 ---
 
-## ☑️ PHASE 12: PUBLIC COMMONS — DELTA SHARING + GITHUB ARCHIVE (planned)
+## ☑️ PHASE 12: PUBLIC COMMONS — LOCAL EXPORT + SEAL LOG (15 minutes)
 
-**Status:** Designed, not yet implemented.
 **Plan ref:** `openclaw/EXECUTION_public_commons.md`.
 
-What this phase does: makes the audit trail publicly queryable. Adds a `delta-sharing-server` sidecar exposing five curated views (`published_briefs`, `published_fairness_scorecards`, `ai_usage_ledger`, `published_run_summaries`, `retractions`) over the open Delta Sharing protocol. Adds `openclaw/github_publisher.py` for bidirectional sync with a public GitHub repo (push promoted briefs as markdown; pull retraction commits back into Delta). Adds `openclaw/ledger_rollup.py` that computes daily AI-usage rollups (token counts, cost, give-back ratio). Publishes daily Merkle seals to a public `SEALS.md` file so external observers can verify the integrity chain without access to `SECRET_SALT`. Optional static status page surfaces the proportionality story at a glance.
+What this phase does: ships `openclaw/commons_publisher.py` — three subcommands that produce the durable public commons output to a local export directory. The directory is the **content** of the public commons; pushing it to a public GitHub repo (or any other distribution channel — API, MCP, website, the choice was deferred earlier) is a separate step and explicitly out of Phase 12 v1 scope.
 
-This is the only phase that introduces an intentionally public surface; threat model and egress cost discipline are documented in the plan.
+| Subcommand | Output | Purpose |
+|---|---|---|
+| `rollup-ledger` | `<commons>/ledger/<YYYY-MM-DD>.md` + Delta `research.shared.ai_usage_ledger` | Daily AI-usage rollup with `give_back_ratio` |
+| `export-briefs` | `<commons>/briefs/<YYYY-MM>/<published_id>.md` | Markdown copies of every PROMOTED brief |
+| `publish-seal` | `<commons>/SEALS.md` | Append-only public log of daily Merkle seals |
+| `publish-all` | All three, idempotent | Single nightly cron entry |
 
-Runbook will be added here when the phase is implemented.
+**Phase 12 explicitly defers** (each has clean follow-up paths once the user decides how to distribute):
+
+- **Delta Sharing OSS server sidecar.** Provides programmatic read access to the five curated views. Worth adding when there's a downstream consumer; the markdown export is the human-readable surface for v1.
+- **Public TLS endpoint, domain, CDN.** The user explicitly deferred the access-method decision (API / MCP / website / git / combination) until there's something to view. Phase 12 v1 produces the something.
+- **Bidirectional GitHub sync.** Phase 12 v1 ships a `parse_retraction_commits` utility (so the parser is ready and tested), but doesn't actually invoke `git log`. When the export dir is published to a public repo, a follow-up step wires up the parser to a periodic `git log --grep='^retraction:'` invocation.
+
+### Prerequisites
+- [ ] Phase 11 complete (124+ tests passing, drills clean)
+- [ ] At least one PROMOTED entry in `public_archive.published` (Phase 10's smoke test produced one)
+- [ ] At least one CHECKPOINT entry in `audit.integrity_chain` (Phase 8's seal smoke test produced one — or run `integrity_engine.py seal` manually)
+- [ ] `SECRET_SALT` exported (the seal publish doesn't need it directly, but the chain audit run as part of `publish-all` does for verification)
+
+### Step 73: Pull Phase 12 files to the VM
+```bash
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/commons_publisher.py \
+  openclaw-secure-node:~/openclaw/
+
+gcloud compute scp \
+  --zone=us-east4-a --tunnel-through-iap --project=orphansinthedesert \
+  openclaw/tests/test_commons_publisher.py \
+  openclaw-secure-node:~/openclaw/tests/
+```
+
+### Step 74: Run unit tests on the VM
+```bash
+oc-ssh
+cd ~ && python3 -m pytest openclaw/tests/test_commons_publisher.py -v
+```
+Expected: 23 passing (rollup math, brief export idempotency, seal log append, retraction parser, Pydantic guards).
+
+### Step 75: Create the commons export directory
+```bash
+sudo mkdir -p /mnt/disks/research/public_commons_export
+sudo chown -R "$(id -u):$(id -g)" /mnt/disks/research/public_commons_export
+ls -la /mnt/disks/research/public_commons_export
+```
+
+### Step 76: Compute yesterday's AI-usage ledger entry
+```bash
+python3 ~/openclaw/commons_publisher.py rollup-ledger
+# Expected:
+#   ✓ ledger entry written
+#     period:           2026-05-07 to 2026-05-07
+#     briefs_published: <N>
+#     estimated_cost:   $0.0xxx
+#     give_back_ratio:  <ratio> briefs/USD
+#     human-readable:   /mnt/disks/research/public_commons_export/ledger/2026-05-07.md
+
+cat /mnt/disks/research/public_commons_export/ledger/$(date -u -d "yesterday" +%Y-%m-%d).md
+# Or if `date -d` isn't available: cat the file from the path above.
+```
+
+If you want a specific date (e.g., the day Phase 9 ran the smoke test):
+```bash
+python3 ~/openclaw/commons_publisher.py rollup-ledger --date 2026-05-07
+```
+
+### Step 77: Export PROMOTED briefs as markdown
+```bash
+python3 ~/openclaw/commons_publisher.py export-briefs
+# Expected:
+#   ✓ exported N new brief(s)
+#     briefs/2026-05/pub-<12hex>.md
+
+# Inspect one
+ls -R /mnt/disks/research/public_commons_export/briefs/
+cat /mnt/disks/research/public_commons_export/briefs/2026-05/pub-<id>.md | head -30
+```
+
+Re-running is a no-op (idempotent — files already match their `content_hash`):
+```bash
+python3 ~/openclaw/commons_publisher.py export-briefs
+# Expected: ✓ exported 0 new brief(s) / (N brief(s) already up-to-date — content_hash matched)
+```
+
+### Step 78: Publish the daily seal to SEALS.md
+```bash
+python3 ~/openclaw/commons_publisher.py publish-seal
+# Expected: ✓ appended N new seal(s) to /mnt/disks/research/public_commons_export/SEALS.md
+
+cat /mnt/disks/research/public_commons_export/SEALS.md
+# Expected format:
+#   2026-05-08  seq=42  merkle=ae48f...  seal=8b91d4...  salt_v=1
+```
+
+The `merkle` field is the Merkle root over that day's chain row signatures; an external observer can verify it without `SECRET_SALT` by pulling the chain and recomputing. The `seal` field is the salted signature, verifiable by anyone holding `SECRET_SALT`.
+
+### Step 79: Combined nightly run
+```bash
+python3 ~/openclaw/commons_publisher.py publish-all
+# Runs all three above, idempotent. This is the cron line.
+```
+
+### Step 80: Wire to nightly cron (4:56 PM EDT, just after the daily seal)
+```bash
+oc-ssh
+crontab -e
+# Add (one line):
+56 20 * * 1-5 SECRET_SALT=$(grep '^SECRET_SALT=' /mnt/disks/research/.secrets/.env | cut -d= -f2) /usr/bin/python3 /home/$(whoami)/openclaw/commons_publisher.py publish-all >> /mnt/disks/research/logs/commons_publish.log 2>&1
+```
+
+This runs one minute after the Phase 8 daily seal cron entry (4:55 PM EDT). The order matters: integrity_engine writes the CHECKPOINT first, then commons_publisher captures it into SEALS.md.
+
+### Step 81: Inspect the full commons output
+```bash
+tree /mnt/disks/research/public_commons_export
+# Expected layout:
+# .
+# ├── briefs/
+# │   └── 2026-05/
+# │       ├── pub-001.md
+# │       └── pub-002.md
+# ├── ledger/
+# │   └── 2026-05-07.md
+# └── SEALS.md
+```
+
+This directory is the **content** of the public commons. Distribution is a separate concern (deferred per the EXECUTION_public_commons.md "Open Questions" resolution).
+
+### Phase 12 Sign-off
+- [ ] All 23 commons-publisher unit tests pass on the VM
+- [ ] `rollup-ledger` writes a Delta row to `research.shared.ai_usage_ledger` AND a markdown file under `ledger/`
+- [ ] `export-briefs` produces one `.md` file per PROMOTED entry; second invocation is a no-op
+- [ ] `publish-seal` appends a line to `SEALS.md` for each new CHECKPOINT; second invocation is a no-op
+- [ ] `publish-all` succeeds end-to-end
+- [ ] Cron entry added for 4:56 PM EDT daily commons publish
+- [ ] Integrity chain still reports `INTACT` after the Phase 12 writes
+
+When all 7 are checked, Phase 12 v1 is complete. Phase 12.5 (Delta Sharing server sidecar) and Phase 12.6 (public distribution — GitHub or otherwise) are follow-ups.
+
+### Phase 12 follow-ups (when ready)
+
+**12.5 — Delta Sharing OSS server sidecar.** Add `delta-sharing-server` to `sandbox/gcp/sidecars.sh`, point it at `/mnt/disks/research/delta`, expose the five curated views over the open Delta Sharing protocol. Bind to 127.0.0.1 initially. Schema is already designed; only the sidecar config is missing.
+
+**12.6 — Public distribution.** Wire the export directory to a public GitHub repo (single `git push` cron after `publish-all`). Optional: Cloudflare in front of a TLS endpoint to the Delta Sharing server. Choose API / MCP / website / combination based on which audience emerges. Both halves of the bidirectional retraction sync (push briefs, parse retraction commits) become operationally relevant at this point — `parse_retraction_commits` is ready and tested.
+
+### Phase 12 cost impact
+**$0/mo.** Local file writes to the existing persistent disk; export size after several months of operation should be well under 100 MB. Egress is $0 because nothing leaves the VM in v1 (distribution deferred).
 
 ---
 
